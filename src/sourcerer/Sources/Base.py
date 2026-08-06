@@ -109,6 +109,15 @@ class SourceBase(ABC):
     collections = ()
     #: Collection name to one line description, shown in `--help`.
     collection_help = {}
+    #: License the source distributes its data under, e.g. 'CC BY 4.0'.
+    #: Shown in `sourcerer sources list` and recorded in download provenance,
+    #: since it is what governs how downloaded data may be reused.
+    license = ''
+    #: How to cite this source, one string per paper, oldest first. Shown in
+    #: `sourcerer sources list` and recorded in download provenance, so that
+    #: the record of what was downloaded travels with a reminder of how to
+    #: give the source credit for it.
+    citation = ()
 
     def __init__(self, client, schema=None):
         """

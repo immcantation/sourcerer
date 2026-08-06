@@ -176,7 +176,7 @@ def commandLine():
 
 
 def writeDownloadMetadata(out, source, collection, filters, limit, formats,
-                          units, schema=None):
+                          units, schema=None, license=None, citation=None):
     """
     Write or update the provenance record for a download directory.
 
@@ -191,6 +191,11 @@ def writeDownloadMetadata(out, source, collection, filters, limit, formats,
       formats (list): formats written this run.
       units (list): unit records from buildUnitRecord.
       schema (SourceSchema): the snapshot the query resolved against, if known.
+      license (str): the source's data license, if known. Recorded so a reader
+        of this directory alone, with no access to sourcerer's own docs, still
+        knows the terms the data was obtained under.
+      citation (tuple): the source's requested citation(s), if known, for the
+        same reason.
 
     Returns:
       Path: the file written.
@@ -222,9 +227,13 @@ def writeDownloadMetadata(out, source, collection, filters, limit, formats,
         'sourcerer_metadata_version': METADATA_VERSION,
         'source': source,
         'generated_by': 'sourcerer %s' % __version__,
-        'runs': list(record.get('runs') or []) + [run],
-        'units': mergeUnits(record.get('units') or [], units),
     }
+    if license is not None:
+        merged['data_license'] = license
+    if citation:
+        merged['data_citation'] = list(citation)
+    merged['runs'] = list(record.get('runs') or []) + [run]
+    merged['units'] = mergeUnits(record.get('units') or [], units)
 
     with open(path, 'w') as handle:
         yaml.safe_dump(merged, handle, sort_keys=False, default_flow_style=False)

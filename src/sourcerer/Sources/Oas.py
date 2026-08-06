@@ -923,6 +923,20 @@ class OasSource(SourceBase):
     collections = COLLECTIONS
     collection_help = COLLECTION_HELP
 
+    #: OAS distributes its data under CC BY 4.0, per its homepage; the two
+    #: papers below are what it asks to be cited in exchange for that license.
+    license = 'CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)'
+    citation = (
+        'Kovaltsuk A, Leem J, Kelm S, Snowden J, Deane CM, Krawczyk K. '
+        'Observed Antibody Space: A Resource for Data Mining Next-Generation '
+        'Sequencing of Antibody Repertoires. J Immunol. 2018;201(8):2502-2509. '
+        'doi:10.4049/jimmunol.1800708',
+        'Olsen TH, Boyles F, Deane CM. Observed Antibody Space: A diverse '
+        'database of cleaned, annotated, and translated unpaired and paired '
+        'antibody sequences. Protein Sci. 2022;31(1):141-146. '
+        'doi:10.1002/pro.4205',
+    )
+
     #: Namespace generated identifiers with the unit stem. Off by default: one
     #: output file per unit needs no prefix, and the source's own barcodes are
     #: more useful bare. Anything writing several units into one file must turn

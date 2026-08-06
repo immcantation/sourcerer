@@ -29,6 +29,12 @@ log = logging.getLogger('sourcerer')
 #: Output formats the download and convert subcommands can produce.
 FORMATS = ('raw', 'airr', 'fasta')
 
+#: Above this many values, a filter flag's help lists only a sample instead of
+#: everything, and points at `schema show` for the rest. Enumerated fields are
+#: categorical (species, disease, ...), so in practice this rarely bites; it
+#: exists so one field having many values can't blow up every --help screen.
+VALUE_LIST_CAP = 20
+
 
 def loadSchemaQuietly(name):
     """
@@ -49,7 +55,7 @@ def loadSchemaQuietly(name):
         return None
 
 
-def addFilterArgs(parser, schema, collection):
+def addFilterArgs(parser, schema, source, collection):
     """
     Generate one commandline flag per searchable field.
 
@@ -61,6 +67,7 @@ def addFilterArgs(parser, schema, collection):
     Arguments:
       parser (ArgumentParser): the subparser to add to.
       schema (SourceSchema): the snapshot, or None if none is installed.
+      source (str): the source name, for the `schema show` pointer on overflow.
       collection (str): which collection's fields to add.
     """
     if schema is None or collection not in schema.collections:
@@ -69,9 +76,16 @@ def addFilterArgs(parser, schema, collection):
     for item in schema.getCollection(collection).fields:
         if item.pseudo_values:
             summary = 'filter on whether %s is recorded' % item.name
+        elif len(item.values) <= VALUE_LIST_CAP:
+            summary = '%d values: %s' % (len(item.values), ', '.join(item.values))
         else:
-            examples = ', '.join(item.values[:3])
-            summary = '%d values, e.g. %s' % (len(item.values), examples)
+            # Overflow only: today's fields (species, disease, ...) all stay well
+            # under the cap. Once `sourcerer build` (the interactive command
+            # builder, see plan phase 6) exists, point there instead.
+            shown = ', '.join(item.values[:VALUE_LIST_CAP])
+            summary = ('%d values, e.g. %s, ... run `sourcerer schema show '
+                       '--source %s --collection %s --field %s` for the full list'
+                       % (len(item.values), shown, source, collection, item.name))
 
         parser.add_argument(item.flag, dest='filter_%s' % item.name,
                             metavar='VALUE', default=None, help=summary)
@@ -118,10 +132,16 @@ def getArgParser():
     commands = parser.add_subparsers(title='subcommands', dest='command',
                                      metavar='')
 
-    sources = commands.add_parser('sources', help='list available sources',
-                                  formatter_class=CommonHelpFormatter)
+    sources = commands.add_parser(
+        'sources', help='list available sources',
+        description='List every data source sourcerer knows how to fetch '
+                    'from, along with a one-line description and its homepage.',
+        formatter_class=CommonHelpFormatter)
     sources.add_subparsers(dest='action', metavar='').add_parser(
-        'list', help='list the sources sourcerer knows about')
+        'list', help='list the sources sourcerer knows about',
+        description='List every data source sourcerer knows how to fetch '
+                    'from, along with a one-line description and its homepage.',
+        formatter_class=CommonHelpFormatter)
 
     _addSchemaParser(commands)
     for name, source in sorted(REGISTRY.items()):
@@ -132,12 +152,21 @@ def getArgParser():
 
 def _addSchemaParser(commands):
     """Add the schema subcommand tree."""
-    schema = commands.add_parser('schema', help='inspect and refresh snapshots',
-                                 formatter_class=CommonHelpFormatter)
+    schema = commands.add_parser(
+        'schema', help='inspect and refresh snapshots',
+        description='Inspect the schema snapshot checked into the package, '
+                    'or re-harvest it from the remote source when the '
+                    'upstream API changes (new organisms, fields, values, ...).',
+        formatter_class=CommonHelpFormatter)
     actions = schema.add_subparsers(dest='action', metavar='')
 
-    show = actions.add_parser('show', help='print a stored snapshot',
-                              formatter_class=CommonHelpFormatter)
+    show = actions.add_parser(
+        'show', help='print a stored snapshot',
+        description='Print the schema snapshot stored for a source: its '
+                    'collections and how many fields each has, one '
+                    'collection\'s fields and how many values each accepts, '
+                    'or every value a single field accepts.',
+        formatter_class=CommonHelpFormatter)
     show.add_argument('--source', required=True, choices=sorted(REGISTRY),
                       help='which source to read the snapshot of')
     show.add_argument('--collection', default=None,
@@ -147,8 +176,14 @@ def _addSchemaParser(commands):
                       help='print every value this field accepts, one per line; '
                            'needs --collection')
 
-    refresh = actions.add_parser('refresh', help='re-harvest a snapshot',
-                                 formatter_class=CommonHelpFormatter)
+    refresh = actions.add_parser(
+        'refresh', help='re-harvest a snapshot',
+        description='Contact a remote source, re-harvest its schema and '
+                    'catalogs, and write the result over the packaged '
+                    'snapshot (or alongside it, with --out). Previously '
+                    'fetched detail-page enrichment is carried forward '
+                    'unless --refresh-details asks to redo it.',
+        formatter_class=CommonHelpFormatter)
     refresh.add_argument('--source', required=True, choices=sorted(REGISTRY),
                          help='which source to contact and re-harvest')
     refresh.add_argument('--out', default=None, type=Path,
@@ -169,14 +204,27 @@ def _addSourceParser(commands, name, source):
     """Add one source's subcommand tree, with a level per collection."""
     schema = loadSchemaQuietly(name)
 
-    parser = commands.add_parser(name, help=source.description,
-                                 formatter_class=CommonHelpFormatter)
+    parser = commands.add_parser(
+        name, help=source.description,
+        description='%s\n\nHomepage: %s' % (source.description, source.homepage),
+        formatter_class=CommonHelpFormatter)
     actions = parser.add_subparsers(dest='action', metavar='ACTION',
                                     required=True)
 
-    for action, helptext in (('search', 'list matching data units'),
-                             ('download', 'download matching data units')):
+    action_help = {
+        'search': ('list matching data units',
+                   'Search a collection for data units matching the given '
+                   'filters and print (or save with --out) a summary of what '
+                   'matched. Nothing is downloaded.'),
+        'download': ('download matching data units',
+                    'Search a collection for data units matching the given '
+                    'filters, download each one, and optionally convert it '
+                    'to AIRR and/or FASTA, writing a samplesheet for each '
+                    'converted format.'),
+    }
+    for action, (helptext, description) in action_help.items():
         action_parser = actions.add_parser(action, help=helptext,
+                                           description=description,
                                            formatter_class=CommonHelpFormatter)
         # The collection is a subcommand rather than a flag because the two
         # collections have genuinely different field sets. argparse cannot vary
@@ -191,10 +239,14 @@ def _addSourceParser(commands, name, source):
                                                    required=True)
         for collection in source.collections:
             # Passing help is what makes argparse list the collection at all.
-            leaf = collections.add_parser(collection,
-                                          help=source.collection_help.get(collection),
-                                          formatter_class=CommonHelpFormatter)
-            addFilterArgs(leaf, schema, collection)
+            collection_help = source.collection_help.get(collection)
+            leaf = collections.add_parser(
+                collection, help=collection_help,
+                description='%s the %s collection (%s), optionally narrowed '
+                            'down with the filter flags below.'
+                            % (action.capitalize(), collection, collection_help),
+                formatter_class=CommonHelpFormatter)
+            addFilterArgs(leaf, schema, name, collection)
             leaf.add_argument('--limit', type=int, default=None,
                               help='stop after this many units')
             if action == 'search':
@@ -231,6 +283,10 @@ def handleSources(args):
     for name, source in sorted(REGISTRY.items()):
         print('%-10s %s' % (name, source.description))
         print('%-10s %s' % ('', source.homepage))
+        if source.license:
+            print('%-10s license: %s' % ('', source.license))
+        for paper in source.citation:
+            print('%-10s cite: %s' % ('', paper))
 
     return 0
 
@@ -409,7 +465,8 @@ def handleDownload(args):
     # of the output that cannot be regenerated from anything else here.
     record = Provenance.writeDownloadMetadata(
         outdir, args.source, args.collection, collectFilters(args), args.limit,
-        formats, provenance, schema=source.schema)
+        formats, provenance, schema=source.schema, license=source.license,
+        citation=source.citation)
     log.info('wrote %s', record)
 
     return 0

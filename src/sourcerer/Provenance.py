@@ -18,7 +18,7 @@ __author__ = 'Susanna Marquez'
 # Imports
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
@@ -43,7 +43,7 @@ def timestamp():
     Returns:
       str: the current time as an ISO 8601 UTC string.
     """
-    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    return datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def relativize(path, root):

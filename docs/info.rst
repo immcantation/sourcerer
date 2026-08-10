@@ -37,6 +37,32 @@ asks that both of the following be cited:
   *Protein Sci*. 2022;31(1):141-146.
   doi:`10.1002/pro.4205 <https://doi.org/10.1002/pro.4205>`__
 
+IMGT
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Data from `IMGT <https://www.imgt.org/genedb/>`__ is governed by the `IMGT terms
+of use <https://www.imgt.org/about/termsofuse.php>`__: it is free for academic
+research on condition that IMGT is cited. IMGT asks that the following be cited:
+
+- Lefranc MP, Giudicelli V, Duroux P, et al. IMGT, the international
+  ImMunoGeneTics information system 25 years on. *Nucleic Acids Res*.
+  2015;43(Database issue):D413-D422.
+  doi:`10.1093/nar/gku1056 <https://doi.org/10.1093/nar/gku1056>`__
+
+The ``airrc-imgt`` blend uses IMGT data too, so its downloads carry this
+obligation as well as the OGRDB one below.
+
+OGRDB
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Data from `OGRDB <https://ogrdb.airr-community.org/>`__ is distributed under a
+`CC BY 4.0 <https://creativecommons.org/licenses/by/4.0/>`__ license. In
+exchange, OGRDB asks that the following be cited:
+
+- Lees WD, Busse CE, Corcoran M, et al. OGRDB: a reference database of inferred
+  immune receptor genes. *Nucleic Acids Res*. 2020;48(D1):D964-D970.
+  doi:`10.1093/nar/gkz822 <https://doi.org/10.1093/nar/gkz822>`__
+
 
 License
 --------------------------------------------------------------------------------

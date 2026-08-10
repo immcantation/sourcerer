@@ -27,11 +27,11 @@ For development, install in editable mode with the ``dev`` extra, which adds
 Requirements
 --------------------------------------------------------------------------------
 
-+  `Python 3.10 <https://python.org>`__
++  `Python 3.11 <https://python.org>`__
 +  `requests 2.28 <https://requests.readthedocs.io>`__
 +  `beautifulsoup4 4.11 <https://www.crummy.com/software/BeautifulSoup>`__
 +  `PyYAML 6.0 <https://pyyaml.org>`__
-+  `pandas 1.5 <https://pandas.pydata.org>`__
++  `pandas 2.2.3 <https://pandas.pydata.org>`__
 +  `airr 2.0 <https://airr-standards.readthedocs.io>`__
 +  `tqdm 4.64 <https://tqdm.github.io>`__
 

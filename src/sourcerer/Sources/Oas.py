@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import re
+from datetime import UTC
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -964,7 +965,7 @@ class OasSource(SourceBase):
         Returns:
           SourceSchema: the harvested snapshot.
         """
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from sourcerer.Schema import Collection, Field, SourceSchema
         from sourcerer.Version import __version__
@@ -980,7 +981,7 @@ class OasSource(SourceBase):
 
         return SourceSchema(
             source=self.name,
-            harvested=datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            harvested=datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%SZ'),
             harvested_by='sourcerer %s' % __version__,
             source_urls={'paired_form': PAIRED_FORM_URL,
                          'unpaired_form': UNPAIRED_FORM_URL,
@@ -1106,13 +1107,13 @@ class OasSource(SourceBase):
         Returns:
           int: how many units were successfully enriched.
         """
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         pending = list(rows) if force else [x for x in rows if needsDetail(x)]
         if limit is not None:
             pending = pending[:limit]
 
-        stamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        stamp = datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
         enriched = 0
         for row in pending:
             url = '%s?unit=%s' % (DETAIL_URL % row['collection'], row['unit_id'])

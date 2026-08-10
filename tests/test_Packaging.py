@@ -8,9 +8,8 @@ __author__ = 'Susanna Marquez'
 # Imports
 import os
 import re
-import unittest
-
 import tomllib
+import unittest
 
 # Sourcerer imports
 import sourcerer

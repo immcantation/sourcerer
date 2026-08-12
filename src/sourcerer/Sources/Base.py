@@ -101,6 +101,10 @@ class SourceBase(ABC):
 
     #: Short name used on the commandline and as the schema directory name.
     name = None
+    #: Alternative commandline names for the same source, e.g. ('airrc',) for
+    #: OGRDB. They share the source's subcommand, flags and schema; the canonical
+    #: ``name`` is what schema and provenance are keyed on.
+    aliases = ()
     #: One line description for `sourcerer sources list`.
     description = ''
     #: Where a human can read about the source.
@@ -118,6 +122,12 @@ class SourceBase(ABC):
     #: the record of what was downloaded travels with a reminder of how to
     #: give the source credit for it.
     citation = ()
+    #: What the source produces, and therefore which output path `download`
+    #: drives. 'dataset' sources are repertoires: they convert to AIRR/FASTA and
+    #: write an airrflow samplesheet. 'reference' sources are germline sets: they
+    #: build an airrflow germline reference_base instead, and never touch the
+    #: rearrangement conversion path. See sourcerer.Reference.ReferenceSource.
+    output = 'dataset'
 
     def __init__(self, client, schema=None):
         """

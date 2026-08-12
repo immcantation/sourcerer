@@ -15,13 +15,13 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 # Sourcerer imports
-from sourcerer import Catalog, Convert, Provenance
+from sourcerer import Catalog, Convert, Provenance, Reference
 from sourcerer.Airrflow import buildSamplesheet
 from sourcerer.Commandline import CommonHelpFormatter, setupLogging
 from sourcerer.Exceptions import SourcererError
 from sourcerer.Http import HttpClient
 from sourcerer.Schema import loadSchema, saveSchema
-from sourcerer.Sources import REGISTRY, getSource
+from sourcerer.Sources import ALIASES, REGISTRY, canonicalName, getSource
 from sourcerer.Version import __date__, __version__
 
 log = logging.getLogger('sourcerer')
@@ -144,10 +144,47 @@ def getArgParser():
         formatter_class=CommonHelpFormatter)
 
     _addSchemaParser(commands)
+    _addReferenceParser(commands)
     for name, source in sorted(REGISTRY.items()):
         _addSourceParser(commands, name, source)
 
     return parser
+
+
+def _addReferenceParser(commands):
+    """Add the reference subcommand: validate and build from a reference folder."""
+    reference = commands.add_parser(
+        'reference', help='validate a germline reference folder and build '
+                          'IgBLAST databases from it',
+        description='Check that a folder of germline FASTAs is in a format '
+                    'airrflow can use, and build the IgBLAST databases from it. '
+                    'Files are recognised by name, in any directory layout: the '
+                    'species and chain, with an optional source prefix and an '
+                    'optional aa marker for translated V, as in human_IGHV.fasta '
+                    'or imgt_human_IGHV.fasta.',
+        formatter_class=CommonHelpFormatter)
+    actions = reference.add_subparsers(dest='action', metavar='ACTION',
+                                       required=True)
+
+    build = actions.add_parser(
+        'build', help='validate a reference folder and build IgBLAST databases',
+        description='Validate the reference folder and build the IgBLAST '
+                    'databases from it. With --check, only validate and report, '
+                    'building nothing (and needing no makeblastdb).',
+        formatter_class=CommonHelpFormatter)
+    build.add_argument('folder', type=Path,
+                       help='a reference_base tree or a flat folder of germline '
+                            'FASTAs named <species>_<CHAIN>.fasta')
+    build.add_argument('--out', type=Path, default=None,
+                       help='directory to write igblast_base into; required '
+                            'unless --check')
+    build.add_argument('--check', action='store_true',
+                       help='validate the folder and report what would build, '
+                            'without building anything')
+    build.add_argument('--species', nargs='+', choices=list(Reference.SPECIES),
+                       default=None,
+                       help='limit to these species; default is every species '
+                            'found in the folder')
 
 
 def _addSchemaParser(commands):
@@ -167,8 +204,8 @@ def _addSchemaParser(commands):
                     'collection\'s fields and how many values each accepts, '
                     'or every value a single field accepts.',
         formatter_class=CommonHelpFormatter)
-    show.add_argument('--source', required=True, choices=sorted(REGISTRY),
-                      help='which source to read the snapshot of')
+    show.add_argument('--source', required=True, choices=sorted(REGISTRY) + sorted(ALIASES),
+                      help='which source (or alias) to read the snapshot of')
     show.add_argument('--collection', default=None,
                       help='list this collection\'s fields; without it, print '
                            'one summary line per collection')
@@ -184,7 +221,7 @@ def _addSchemaParser(commands):
                     'fetched detail-page enrichment is carried forward '
                     'unless --refresh-details asks to redo it.',
         formatter_class=CommonHelpFormatter)
-    refresh.add_argument('--source', required=True, choices=sorted(REGISTRY),
+    refresh.add_argument('--source', required=True, choices=sorted(REGISTRY) + sorted(ALIASES),
                          help='which source to contact and re-harvest')
     refresh.add_argument('--out', default=None, type=Path,
                          help='directory to write into; without it the packaged '
@@ -205,7 +242,7 @@ def _addSourceParser(commands, name, source):
     schema = loadSchemaQuietly(name)
 
     parser = commands.add_parser(
-        name, help=source.description,
+        name, aliases=list(source.aliases), help=source.description,
         description='%s\n\nHomepage: %s' % (source.description, source.homepage),
         formatter_class=CommonHelpFormatter)
     actions = parser.add_subparsers(dest='action', metavar='ACTION',
@@ -254,23 +291,34 @@ def _addSourceParser(commands, name, source):
                                   help='write the hits to a TSV file')
             else:
                 leaf.add_argument('--outdir', type=Path, required=True,
-                                  help='directory to write into; one '
-                                       'subdirectory per format, plus a '
-                                       'samplesheet for each converted format')
-                leaf.add_argument('--format', action='append', dest='formats',
-                                  choices=FORMATS,
-                                  help='what to write, repeatable to write '
-                                       'several; raw mirrors the source files '
-                                       'untouched and is always written because '
-                                       'the others are converted from it, so '
-                                       'omitting this writes raw alone')
+                                  help='directory to write into')
                 leaf.add_argument('--dry-run', action='store_true',
                                   help='report what would be fetched, then stop')
                 leaf.add_argument('--no-resume', action='store_true',
                                   help='re-download in full rather than '
                                        'continuing a partly fetched file')
-                leaf.add_argument('--strict-airr', action='store_true',
-                                  help='drop columns the AIRR schema does not define')
+                if source.output == 'reference':
+                    # Reference sources build a germline reference_base rather
+                    # than converting to AIRR, so they take the igblast options
+                    # instead of the format and AIRR-strictness ones.
+                    leaf.add_argument('--igblast', action='store_true',
+                                      help='also build the IgBLAST databases '
+                                           'from the reference; needs makeblastdb '
+                                           'on PATH')
+                    leaf.add_argument('--igblast-out', type=Path, default=None,
+                                      help='where to write igblast_base; '
+                                           'defaults to <outdir>/igblast_base')
+                else:
+                    leaf.add_argument('--format', action='append', dest='formats',
+                                      choices=FORMATS,
+                                      help='what to write, repeatable to write '
+                                           'several; raw mirrors the source files '
+                                           'untouched and is always written because '
+                                           'the others are converted from it, so '
+                                           'omitting this writes raw alone')
+                    leaf.add_argument('--strict-airr', action='store_true',
+                                      help='drop columns the AIRR schema does '
+                                           'not define')
 
 
 def makeClient(args):
@@ -282,6 +330,8 @@ def handleSources(args):
     """List registered sources."""
     for name, source in sorted(REGISTRY.items()):
         print('%-10s %s' % (name, source.description))
+        if source.aliases:
+            print('%-10s alias: %s' % ('', ', '.join(source.aliases)))
         print('%-10s %s' % ('', source.homepage))
         if source.license:
             print('%-10s license: %s' % ('', source.license))
@@ -293,6 +343,7 @@ def handleSources(args):
 
 def handleSchemaShow(args):
     """Print a stored snapshot."""
+    args.source = canonicalName(args.source)
     schema = loadSchema(args.source)
 
     if args.collection is None:
@@ -324,6 +375,7 @@ def handleSchemaShow(args):
 
 def handleSchemaRefresh(args):
     """Re-harvest a snapshot and its catalogs."""
+    args.source = canonicalName(args.source)
     client = makeClient(args)
     source = getSource(args.source, client)
 
@@ -391,10 +443,87 @@ def handleSearch(args):
     return 0
 
 
+def handleReference(args):
+    """Validate a reference folder and, unless --check, build its IgBLAST base."""
+    if not args.folder.is_dir():
+        raise SourcererError('no such reference folder: %s' % args.folder)
+
+    plan = Reference.planReference(args.folder, species=args.species)
+    print(plan.summary())
+
+    if not plan.ok:
+        raise SourcererError('no databases can be built from %s; check the file '
+                             'names against <species>_<CHAIN>.fasta' % args.folder)
+
+    if args.check:
+        return 0
+
+    if args.out is None:
+        raise SourcererError('--out is required to build; pass --check to only '
+                             'validate the folder')
+
+    Reference.buildFromPlan(plan, args.out, makeClient(args))
+    log.info('wrote %s', args.out)
+
+    return 0
+
+
+def handleReferenceDownload(args, source):
+    """Download germline sets and build an airrflow reference_base."""
+    query = source.validateQuery(args.collection, collectFilters(args))
+    if args.limit is not None:
+        query = type(query)(collection=query.collection, filters=query.filters,
+                            limit=args.limit)
+
+    units = source.searchUnits(query)
+    log.info('%d germline files for %s %s',
+             len(units), args.source, args.collection)
+
+    if args.dry_run:
+        for unit in units:
+            print('%-48s %s' % (unit.unit_id, unit.url))
+        log.info('dry run: nothing downloaded')
+        return 0
+
+    outdir = Path(args.outdir)
+    raw_dir = outdir / 'raw'
+
+    entries, provenance = [], []
+    for unit in units:
+        result = source.fetchUnit(unit, raw_dir, resume=not args.no_resume)
+        entries.append((unit, result.path))
+        provenance.append(Provenance.buildUnitRecord(unit, result, outdir, {}))
+
+    reference_dir = outdir / 'reference_base'
+    source.buildReference(entries, reference_dir).logSummary()
+    log.info('wrote %s', reference_dir)
+
+    formats = ['reference']
+    if args.igblast:
+        igblast_out = args.igblast_out or (outdir / 'igblast_base')
+        Reference.buildIgblastBase(reference_dir, igblast_out, source.client,
+                                   species=[args.collection])
+        log.info('wrote %s', igblast_out)
+        formats.append('igblast')
+
+    record = Provenance.writeDownloadMetadata(
+        outdir, args.source, args.collection, collectFilters(args), args.limit,
+        formats, provenance, schema=source.schema, license=source.license,
+        citation=source.citation)
+    log.info('wrote %s', record)
+
+    return 0
+
+
 def handleDownload(args):
     """Download and optionally convert matching data units."""
     client = makeClient(args)
     source = getSource(args.source, client)
+
+    # Reference sources (germline sets) build a reference_base instead of
+    # converting repertoires to AIRR and writing a samplesheet.
+    if source.output == 'reference':
+        return handleReferenceDownload(args, source)
 
     query = source.validateQuery(args.collection, collectFilters(args))
     if args.limit is not None:
@@ -499,10 +628,16 @@ def main():
                 return handleSchemaRefresh(args)
             parser.parse_args([args.command, '--help'])
 
-        if args.command in REGISTRY:
+        if args.command == 'reference':
+            return handleReference(args)
+
+        source_name = canonicalName(args.command) if args.command else None
+        if source_name in REGISTRY:
             # The action and collection levels are required subparsers, so
-            # argparse has already rejected a commandline missing either.
-            args.source = args.command
+            # argparse has already rejected a commandline missing either. The
+            # command may be an alias (e.g. 'airrc'); resolve it to the canonical
+            # source so schema and provenance use one name.
+            args.source = source_name
             if args.action == 'search':
                 return handleSearch(args)
             if args.action == 'download':

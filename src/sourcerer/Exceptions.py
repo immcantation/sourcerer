@@ -40,6 +40,16 @@ class OasParseError(ParseError):
     pass
 
 
+class ImgtParseError(ParseError):
+    """IMGT content did not match the expected structure."""
+    pass
+
+
+class OgrdbParseError(ParseError):
+    """OGRDB content did not match the expected structure."""
+    pass
+
+
 class SchemaError(SourcererError):
     """A stored schema snapshot is missing, malformed or too new to understand."""
     pass

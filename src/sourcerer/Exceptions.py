@@ -40,6 +40,11 @@ class OasParseError(ParseError):
     pass
 
 
+class IedbParseError(ParseError):
+    """IEDB content did not match the expected structure."""
+    pass
+
+
 class SchemaError(SourcererError):
     """A stored schema snapshot is missing, malformed or too new to understand."""
     pass

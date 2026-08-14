@@ -11,12 +11,15 @@ __author__ = 'Susanna Marquez'
 # Imports
 import logging
 import sys
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
 from pathlib import Path
 
 # Sourcerer imports
 from sourcerer import Catalog, Convert, Provenance
 from sourcerer.Airrflow import buildSamplesheet
+from sourcerer.Annotations import REGISTRY as ANNOTATION_REGISTRY
+from sourcerer.Annotations import getAnnotationSource
+from sourcerer.Annotations.Provenance import writeAnnotationMetadata
 from sourcerer.Commandline import CommonHelpFormatter, setupLogging
 from sourcerer.Exceptions import SourcererError
 from sourcerer.Http import HttpClient
@@ -146,6 +149,7 @@ def getArgParser():
     _addSchemaParser(commands)
     for name, source in sorted(REGISTRY.items()):
         _addSourceParser(commands, name, source)
+    _addAnnotationGroupParser(commands)
 
     return parser
 
@@ -271,6 +275,119 @@ def _addSourceParser(commands, name, source):
                                        'continuing a partly fetched file')
                 leaf.add_argument('--strict-airr', action='store_true',
                                   help='drop columns the AIRR schema does not define')
+
+
+def _addAnnotationParser(commands, name, source):
+    """
+    Add one annotation database's subcommand tree, with a level per table.
+
+    A trimmed copy of `_addSourceParser`: no --format/samplesheet flags, since
+    those are repertoire specific, and one extra synthetic 'all' table that
+    loops every table the database offers.
+    """
+    schema = loadSchemaQuietly(name)
+
+    parser = commands.add_parser(
+        name, help=source.description,
+        description='%s\n\nHomepage: %s' % (source.description, source.homepage),
+        formatter_class=CommonHelpFormatter)
+    actions = parser.add_subparsers(dest='action', metavar='ACTION',
+                                    required=True)
+
+    action_help = {
+        'search': ('list what a table contains',
+                   'Resolve a table, optionally narrowed by filters, and '
+                   'print (or save with --out) a summary of it. Nothing is '
+                   'downloaded.'),
+        'download': ('download a table',
+                    'Fetch a table, optionally narrowed by filters, and '
+                    'write it as a raw mirror plus one normalized TSV.'),
+    }
+    for action, (helptext, description) in action_help.items():
+        action_parser = actions.add_parser(action, help=helptext,
+                                           description=description,
+                                           formatter_class=CommonHelpFormatter)
+        tables = action_parser.add_subparsers(dest='table', metavar='TABLE',
+                                              required=True)
+
+        entries = [(table, source.collection_help.get(table), table)
+                   for table in source.collections]
+        entries.append(('all', 'every table', None))
+
+        for table_name, table_help, filter_table in entries:
+            if filter_table is None:
+                summary = 'every table this database offers'
+            else:
+                summary = 'the %s table (%s), optionally narrowed down with the filter flags below' % (table_name, table_help)
+            leaf = tables.add_parser(
+                table_name, help=table_help,
+                description='%s %s.' % (action.capitalize(), summary),
+                formatter_class=CommonHelpFormatter)
+            if filter_table is not None:
+                addFilterArgs(leaf, schema, name, filter_table)
+            leaf.add_argument('--limit', type=int, default=None,
+                              help='stop after this many rows'
+                                   if filter_table is not None
+                                   else 'stop after this many tables')
+            if action == 'search':
+                leaf.add_argument('-o', '--out', type=Path, default=None,
+                                  help='write the result to a TSV file')
+            else:
+                leaf.add_argument('--outdir', type=Path, required=True,
+                                  help='directory to write into: raw/ '
+                                       'mirrors the upstream file(s), '
+                                       'annotations/ holds the normalized '
+                                       'TSV(s)')
+                leaf.add_argument('--dry-run', action='store_true',
+                                  help='report what would be fetched, then stop')
+                leaf.add_argument('--no-resume', action='store_true',
+                                  help='re-download in full rather than '
+                                       'continuing a partly fetched file')
+
+
+def _addAnnotationGroupParser(commands):
+    """
+    Add the `annotation` subcommand: `list`, one per registered database, and
+    a synthetic `all` that fans out to every registered database.
+    """
+    group = commands.add_parser(
+        'annotations', help='search and download annotation databases',
+        description='Search and download annotation databases (reference '
+                    'tables of epitopes, assays and receptor sequences), as '
+                    'opposed to repertoire sequencing sources.',
+        formatter_class=CommonHelpFormatter)
+    dbs = group.add_subparsers(dest='db', metavar='DB', required=True)
+
+    dbs.add_parser(
+        'list', help='list the annotation databases sourcerer knows about',
+        description='List every annotation database sourcerer knows how to '
+                    'fetch from, along with a one-line description and its '
+                    'homepage.',
+        formatter_class=CommonHelpFormatter)
+
+    for name, source in sorted(ANNOTATION_REGISTRY.items()):
+        _addAnnotationParser(dbs, name, source)
+
+    all_group = dbs.add_parser(
+        'all', help='every registered annotation database',
+        description='Act on every registered annotation database at once.',
+        formatter_class=CommonHelpFormatter)
+    all_actions = all_group.add_subparsers(dest='action', metavar='ACTION',
+                                           required=True)
+    all_download = all_actions.add_parser(
+        'download', help='download every table of every database',
+        description='Download every table of every registered annotation '
+                    'database. Filters cannot be applied here, since '
+                    'different databases have unrelated fields; target one '
+                    'database directly to filter it.',
+        formatter_class=CommonHelpFormatter)
+    all_download.add_argument('--outdir', type=Path, required=True,
+                              help='directory to write into; one '
+                                   'subdirectory per database')
+    all_download.add_argument('--limit', type=int, default=None,
+                              help='stop after this many tables, per database')
+    all_download.add_argument('--dry-run', action='store_true',
+                              help='report what would be fetched, then stop')
 
 
 def makeClient(args):
@@ -472,6 +589,158 @@ def handleDownload(args):
     return 0
 
 
+def _resolveAnnotationTables(source, args):
+    """
+    Return the tables an annotation action should act on.
+
+    Arguments:
+      source (SourceBase): the annotation source.
+      args (Namespace): parsed arguments, carrying `table` and `limit`.
+
+    Returns:
+      list: table names. `--limit` caps how many are used when `table` is
+      'all'; for a single named table it has no effect, since that table
+      alone is already the whole selection.
+    """
+    if args.table != 'all':
+        return [args.table]
+
+    tables = list(source.collections)
+
+    return tables[:args.limit] if args.limit is not None else tables
+
+
+def _writeAnnotationTsv(chunks, out):
+    """
+    Write normalized annotation records as a TSV, streaming chunk by chunk.
+
+    Unlike `Convert.writeAirr`, this performs no AIRR schema validation:
+    annotation columns are a source's own, not AIRR rearrangement fields.
+
+    Arguments:
+      chunks (iterable): DataFrames of normalized records.
+      out (Path): output path.
+
+    Returns:
+      int: rows written.
+    """
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    written = 0
+    header_written = False
+    with open(out, 'w', newline='') as handle:
+        for frame in chunks:
+            frame.to_csv(handle, sep='\t', index=False, header=not header_written)
+            header_written = True
+            written += len(frame)
+
+    if not header_written:
+        out.write_text('')
+
+    return written
+
+
+def handleAnnotationList(args):
+    """List registered annotation databases."""
+    for name, source in sorted(ANNOTATION_REGISTRY.items()):
+        print('%-10s %s' % (name, source.description))
+        print('%-10s %s' % ('', source.homepage))
+        if source.license:
+            print('%-10s license: %s' % ('', source.license))
+        for paper in source.citation:
+            print('%-10s cite: %s' % ('', paper))
+
+    return 0
+
+
+def handleAnnotationSearch(args):
+    """List what a table (or every table) contains, without downloading."""
+    client = makeClient(args)
+    source = getAnnotationSource(args.db, client)
+    filters = collectFilters(args)
+    tables = _resolveAnnotationTables(source, args)
+
+    rows = []
+    for table in tables:
+        query = source.validateQuery(table, filters)
+        for unit in source.searchUnits(query):
+            rows.append({'unit_id': unit.unit_id, 'collection': unit.collection,
+                        'url': unit.url})
+
+    log.info('%d table(s)', len(rows))
+    if args.out is not None:
+        Catalog.saveCatalog(rows, args.out,
+                            columns=('unit_id', 'collection', 'url'))
+        log.info('wrote %s', args.out)
+    else:
+        for row in rows:
+            print('%-16s %-24s %s' % (row['collection'], row['unit_id'], row['url']))
+
+    return 0
+
+
+def handleAnnotationDownload(args):
+    """Download one or more tables: a raw mirror plus one normalized TSV each."""
+    client = makeClient(args)
+    source = getAnnotationSource(args.db, client)
+    filters = collectFilters(args)
+    tables = _resolveAnnotationTables(source, args)
+
+    outdir = Path(args.outdir)
+    raw_dir = outdir / 'raw'
+    normalized_dir = outdir / 'annotations'
+
+    records = []
+    for table in tables:
+        query = source.validateQuery(table, filters)
+        units = source.searchUnits(query)
+
+        if args.dry_run:
+            for unit in units:
+                print('%-16s %s' % (table, unit.unit_id))
+            continue
+
+        for unit in units:
+            result = source.fetchUnit(unit, raw_dir, resume=not args.no_resume)
+            _, chunks, report = source.convertUnit(result.path, unit)
+
+            dest = normalized_dir / ('%s.tsv' % table)
+            rows = _writeAnnotationTsv(chunks, dest)
+            log.info('%s: %d rows in, %d rows written', dest.name,
+                     report['rows_in'], rows)
+
+            records.append(Provenance.buildUnitRecord(unit, result, outdir,
+                                                       {'tsv': dest}))
+
+    if args.dry_run:
+        log.info('dry run: nothing downloaded')
+        return 0
+
+    # An annotation download represents the database's current state, not one
+    # more addition to a growing set the way OAS downloads are, so this always
+    # replaces the metadata file rather than accumulating old runs into it --
+    # see Annotations.Provenance for why that is a separate writer.
+    writeAnnotationMetadata(
+        outdir, args.db, args.table, filters, args.limit, records,
+        schema=source.schema, license=source.license, citation=source.citation)
+
+    return 0
+
+
+def handleAnnotationDownloadAll(args):
+    """Download every table of every registered annotation database."""
+    outdir = Path(args.outdir)
+
+    for name in sorted(ANNOTATION_REGISTRY):
+        log.info('downloading annotation source %s', name)
+        handleAnnotationDownload(Namespace(
+            db=name, table='all', outdir=outdir / name, limit=args.limit,
+            dry_run=args.dry_run, no_resume=False))
+
+    return 0
+
+
 def main():
     """
     Parse the commandline and dispatch to the selected subcommand.
@@ -507,6 +776,18 @@ def main():
                 return handleSearch(args)
             if args.action == 'download':
                 return handleDownload(args)
+
+        if args.command == 'annotations':
+            if args.db == 'list':
+                return handleAnnotationList(args)
+            if args.db == 'all':
+                return handleAnnotationDownloadAll(args)
+            # The action and table levels are required subparsers, so argparse
+            # has already rejected a commandline missing either.
+            if args.action == 'search':
+                return handleAnnotationSearch(args)
+            if args.action == 'download':
+                return handleAnnotationDownload(args)
 
         parser.print_help(sys.stderr)
         return 1

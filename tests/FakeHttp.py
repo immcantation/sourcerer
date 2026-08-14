@@ -11,6 +11,8 @@ cares about in one line.
 __author__ = 'Susanna Marquez'
 
 # Imports
+import json
+
 import requests
 from requests.structures import CaseInsensitiveDict
 
@@ -36,6 +38,10 @@ class FakeResponse:
         """Yield the body in chunk_size pieces."""
         for start in range(0, len(self.content), chunk_size):
             yield self.content[start:start + chunk_size]
+
+    def json(self):
+        """Parse the body as JSON, like requests.Response.json()."""
+        return json.loads(self.content)
 
     def close(self):
         """Mark the response closed."""

@@ -3,13 +3,12 @@ IEDB - B-cell/antibody receptor sequences and assay annotations
 
 IEDB (https://www.iedb.org/) publishes receptor sequences as a single bulk
 ZIP export and assay data through a PostgREST API
-(https://query-api.iedb.org/api/v1). Unlike OAS, a table is not indexed
-elsewhere and then selectively downloaded: the table *is* the data unit, so
-each table produces exactly one DataUnit rather than many.
+(https://query-api.iedb.org/api/v1). A table is not an index into many
+separately downloadable files: the table itself *is* the data unit, so each
+table produces exactly one DataUnit.
 
-There is no HTML search form to scrape here the way there is for OAS, so
-harvestSchema returns a hand curated snapshot rather than one built from a
-live page.
+IEDB has no HTML search form to scrape, so harvestSchema returns a hand
+curated snapshot rather than one built from a live page.
 """
 
 # Info
@@ -165,8 +164,8 @@ class IedbSource(SourceBase):
         """
         Resolve a query to the one DataUnit its table represents.
 
-        A table is not an index of many files the way an OAS collection is;
-        the table itself is the unit, so there is always exactly one.
+        A table is not an index of many files; the table itself is the unit,
+        so there is always exactly one.
 
         Arguments:
           query (Query): the validated request.
@@ -262,8 +261,8 @@ class IedbSource(SourceBase):
             tables are modest enough to read as a single chunk.
 
         Returns:
-          tuple: ({}, iterator of raw record chunks). There is no per-unit
-          metadata line the way OAS data units carry one.
+          tuple: ({}, iterator of raw record chunks). IEDB tables carry no
+          per-unit metadata line.
         """
         if unit.collection in _BULK_TABLES:
             return {}, pandas.read_csv(path, chunksize=chunksize, dtype=str,

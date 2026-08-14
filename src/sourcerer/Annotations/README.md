@@ -1,0 +1,47 @@
+# Annotation databases (work in progress)
+
+Annotation databases are reference tables  (epitopes, assays, receptor
+sequences) rather than repertoire sequencing runs, so they are grouped under
+their own `sourcerer annotations` subcommand instead of being one more
+top-level source. Each registered database exposes `search` and `download`,
+each taking a table as a further subcommand, plus a synthetic `all` table
+that acts on every table the database offers.
+
+## IEDB
+
+[IEDB](https://www.iedb.org/) is the first registered database
+(`src/sourcerer/Annotations/Iedb.py`). It offers four tables:
+
+| table            | contents                                                       | source                           |
+| ---------------- | -------------------------------------------------------------- | -------------------------------- |
+| `bcr`          | BCR (antibody) receptor sequences                              | shared bulk ZIP export           |
+| `tcr`          | TCR receptor sequences, kept for reference                     | shared bulk ZIP export           |
+| `bcell`        | B-cell assay records: antigen, epitope, qualitative outcome    | PostgREST API (`bcell_search`) |
+| `bcr_to_bcell` | join table linking BCR receptor groups to B-cell assay records | PostgREST API (`bcr_to_bcell`) |
+
+### Downloading IEDB data
+
+```bash
+# list every registered annotation database
+sourcerer annotations list
+
+# download one table
+sourcerer annotations iedb download bcr --outdir tmp
+
+# narrow a table down with its filter flags (see --help for what a table supports)
+sourcerer annotations iedb download bcell --qualitative-measure Positive --outdir tmp
+
+# download every iedb table
+sourcerer annotations iedb download all --outdir tmp
+
+# download every table of every registered annotation database
+sourcerer annotations all download --outdir tmp
+
+# see what would be fetched without downloading anything
+sourcerer annotations iedb download bcr --outdir tmp --dry-run
+
+# list what a table contains without downloading it
+sourcerer annotations iedb search bcell --qualitative-measure Positive -o hits.tsv
+```
+
+Referece command: `sourcerer annotations iedb download bcell --help`.

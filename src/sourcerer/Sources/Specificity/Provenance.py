@@ -1,8 +1,8 @@
 """
-Download provenance for annotation sources
+Download provenance for specificity sources
 
-A separate writer from sourcerer.Provenance.writeDownloadMetadata: an
-annotation download represents a database's current state rather than one
+A separate writer from sourcerer.Provenance.writeDownloadMetadata: a
+specificity download represents a database's current state rather than one
 more addition to a growing repertoire dataset, so each run replaces the
 record instead of merging into it. Kept apart from Provenance.py itself so
 this does not change what repertoire sources rely on.
@@ -22,17 +22,17 @@ from sourcerer.Provenance import (DOWNLOAD_METADATA, METADATA_VERSION,
 from sourcerer.Version import __version__
 
 
-def writeAnnotationMetadata(out, source, table, filters, limit, units,
-                            schema=None, license=None, citation=None):
+def writeSpecificityMetadata(out, source, table, filters, limit, units,
+                             schema=None, license=None, citation=None):
     """
-    Write the provenance record for an annotation download directory.
+    Write the provenance record for a specificity download directory.
 
     Unlike Provenance.writeDownloadMetadata, this always replaces the file
     rather than merging into whatever was already there.
 
     Arguments:
       out (Path): the download root. The file is written at its top level.
-      source (str): the annotation database name.
+      source (str): the specificity database name.
       table (str): the table (or 'all') downloaded.
       filters (dict): the filters the user supplied.
       limit (int): the table cap, or None.

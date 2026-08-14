@@ -17,14 +17,14 @@ from pathlib import Path
 # Sourcerer imports
 from sourcerer import Catalog, Convert, Provenance
 from sourcerer.Airrflow import buildSamplesheet
-from sourcerer.Annotations import REGISTRY as ANNOTATION_REGISTRY
-from sourcerer.Annotations import getAnnotationSource
-from sourcerer.Annotations.Provenance import writeAnnotationMetadata
 from sourcerer.Commandline import CommonHelpFormatter, setupLogging
 from sourcerer.Exceptions import SourcererError
 from sourcerer.Http import HttpClient
 from sourcerer.Schema import loadSchema, saveSchema
 from sourcerer.Sources import REGISTRY, getSource
+from sourcerer.Sources.Specificity import REGISTRY as SPECIFICITY_REGISTRY
+from sourcerer.Sources.Specificity import getSpecificitySource
+from sourcerer.Sources.Specificity.Provenance import writeSpecificityMetadata
 from sourcerer.Version import __date__, __version__
 
 log = logging.getLogger('sourcerer')
@@ -149,7 +149,7 @@ def getArgParser():
     _addSchemaParser(commands)
     for name, source in sorted(REGISTRY.items()):
         _addSourceParser(commands, name, source)
-    _addAnnotationGroupParser(commands)
+    _addSpecificityGroupParser(commands)
 
     return parser
 
@@ -277,9 +277,9 @@ def _addSourceParser(commands, name, source):
                                   help='drop columns the AIRR schema does not define')
 
 
-def _addAnnotationParser(commands, name, source):
+def _addSpecificityParser(commands, name, source):
     """
-    Add one annotation database's subcommand tree, with a level per table.
+    Add one specificity database's subcommand tree, with a level per table.
 
     A trimmed copy of `_addSourceParser`: no --format/samplesheet flags, since
     those are repertoire specific, and one extra synthetic 'all' table that
@@ -336,7 +336,7 @@ def _addAnnotationParser(commands, name, source):
                 leaf.add_argument('--outdir', type=Path, required=True,
                                   help='directory to write into: raw/ '
                                        'mirrors the upstream file(s), '
-                                       'annotations/ holds the normalized '
+                                       'specificity/ holds the normalized '
                                        'TSV(s)')
                 leaf.add_argument('--dry-run', action='store_true',
                                   help='report what would be fetched, then stop')
@@ -345,38 +345,38 @@ def _addAnnotationParser(commands, name, source):
                                        'continuing a partly fetched file')
 
 
-def _addAnnotationGroupParser(commands):
+def _addSpecificityGroupParser(commands):
     """
-    Add the `annotation` subcommand: `list`, one per registered database, and
+    Add the `specificity` subcommand: `list`, one per registered database, and
     a synthetic `all` that fans out to every registered database.
     """
     group = commands.add_parser(
-        'annotations', help='search and download annotation databases',
-        description='Search and download annotation databases (reference '
+        'specificity', help='search and download specificity databases',
+        description='Search and download specificity databases (reference '
                     'tables of epitopes, assays and receptor sequences), as '
                     'opposed to repertoire sequencing sources.',
         formatter_class=CommonHelpFormatter)
     dbs = group.add_subparsers(dest='db', metavar='DB', required=True)
 
     dbs.add_parser(
-        'list', help='list the annotation databases sourcerer knows about',
-        description='List every annotation database sourcerer knows how to '
+        'list', help='list the specificity databases sourcerer knows about',
+        description='List every specificity database sourcerer knows how to '
                     'fetch from, along with a one-line description and its '
                     'homepage.',
         formatter_class=CommonHelpFormatter)
 
-    for name, source in sorted(ANNOTATION_REGISTRY.items()):
-        _addAnnotationParser(dbs, name, source)
+    for name, source in sorted(SPECIFICITY_REGISTRY.items()):
+        _addSpecificityParser(dbs, name, source)
 
     all_group = dbs.add_parser(
-        'all', help='every registered annotation database',
-        description='Act on every registered annotation database at once.',
+        'all', help='every registered specificity database',
+        description='Act on every registered specificity database at once.',
         formatter_class=CommonHelpFormatter)
     all_actions = all_group.add_subparsers(dest='action', metavar='ACTION',
                                            required=True)
     all_download = all_actions.add_parser(
         'download', help='download every table of every database',
-        description='Download every table of every registered annotation '
+        description='Download every table of every registered specificity '
                     'database. Filters cannot be applied here, since '
                     'different databases have unrelated fields; target one '
                     'database directly to filter it.',
@@ -589,12 +589,12 @@ def handleDownload(args):
     return 0
 
 
-def _resolveAnnotationTables(source, args):
+def _resolveSpecificityTables(source, args):
     """
-    Return the tables an annotation action should act on.
+    Return the tables a specificity action should act on.
 
     Arguments:
-      source (SourceBase): the annotation source.
+      source (SourceBase): the specificity source.
       args (Namespace): parsed arguments, carrying `table` and `limit`.
 
     Returns:
@@ -610,12 +610,12 @@ def _resolveAnnotationTables(source, args):
     return tables[:args.limit] if args.limit is not None else tables
 
 
-def _writeAnnotationTsv(chunks, out):
+def _writeSpecificityTsv(chunks, out):
     """
-    Write normalized annotation records as a TSV, streaming chunk by chunk.
+    Write normalized specificity records as a TSV, streaming chunk by chunk.
 
     Unlike `Convert.writeAirr`, this performs no AIRR schema validation:
-    annotation columns are a source's own, not AIRR rearrangement fields.
+    specificity columns are a source's own, not AIRR rearrangement fields.
 
     Arguments:
       chunks (iterable): DataFrames of normalized records.
@@ -641,9 +641,9 @@ def _writeAnnotationTsv(chunks, out):
     return written
 
 
-def handleAnnotationList(args):
-    """List registered annotation databases."""
-    for name, source in sorted(ANNOTATION_REGISTRY.items()):
+def handleSpecificityList(args):
+    """List registered specificity databases."""
+    for name, source in sorted(SPECIFICITY_REGISTRY.items()):
         print('%-10s %s' % (name, source.description))
         print('%-10s %s' % ('', source.homepage))
         if source.license:
@@ -654,12 +654,12 @@ def handleAnnotationList(args):
     return 0
 
 
-def handleAnnotationSearch(args):
+def handleSpecificitySearch(args):
     """List what a table (or every table) contains, without downloading."""
     client = makeClient(args)
-    source = getAnnotationSource(args.db, client)
+    source = getSpecificitySource(args.db, client)
     filters = collectFilters(args)
-    tables = _resolveAnnotationTables(source, args)
+    tables = _resolveSpecificityTables(source, args)
 
     rows = []
     for table in tables:
@@ -680,16 +680,16 @@ def handleAnnotationSearch(args):
     return 0
 
 
-def handleAnnotationDownload(args):
+def handleSpecificityDownload(args):
     """Download one or more tables: a raw mirror plus one normalized TSV each."""
     client = makeClient(args)
-    source = getAnnotationSource(args.db, client)
+    source = getSpecificitySource(args.db, client)
     filters = collectFilters(args)
-    tables = _resolveAnnotationTables(source, args)
+    tables = _resolveSpecificityTables(source, args)
 
     outdir = Path(args.outdir)
     raw_dir = outdir / 'raw'
-    normalized_dir = outdir / 'annotations'
+    normalized_dir = outdir / 'specificity'
 
     records = []
     for table in tables:
@@ -706,7 +706,7 @@ def handleAnnotationDownload(args):
             _, chunks, report = source.convertUnit(result.path, unit)
 
             dest = normalized_dir / ('%s.tsv' % table)
-            rows = _writeAnnotationTsv(chunks, dest)
+            rows = _writeSpecificityTsv(chunks, dest)
             log.info('%s: %d rows in, %d rows written', dest.name,
                      report['rows_in'], rows)
 
@@ -717,24 +717,24 @@ def handleAnnotationDownload(args):
         log.info('dry run: nothing downloaded')
         return 0
 
-    # An annotation download represents the database's current state, not one
+    # A specificity download represents the database's current state, not one
     # more addition to a growing set the way OAS downloads are, so this always
     # replaces the metadata file rather than accumulating old runs into it --
-    # see Annotations.Provenance for why that is a separate writer.
-    writeAnnotationMetadata(
+    # see Specificity.Provenance for why that is a separate writer.
+    writeSpecificityMetadata(
         outdir, args.db, args.table, filters, args.limit, records,
         schema=source.schema, license=source.license, citation=source.citation)
 
     return 0
 
 
-def handleAnnotationDownloadAll(args):
-    """Download every table of every registered annotation database."""
+def handleSpecificityDownloadAll(args):
+    """Download every table of every registered specificity database."""
     outdir = Path(args.outdir)
 
-    for name in sorted(ANNOTATION_REGISTRY):
-        log.info('downloading annotation source %s', name)
-        handleAnnotationDownload(Namespace(
+    for name in sorted(SPECIFICITY_REGISTRY):
+        log.info('downloading specificity source %s', name)
+        handleSpecificityDownload(Namespace(
             db=name, table='all', outdir=outdir / name, limit=args.limit,
             dry_run=args.dry_run, no_resume=False))
 
@@ -777,17 +777,17 @@ def main():
             if args.action == 'download':
                 return handleDownload(args)
 
-        if args.command == 'annotations':
+        if args.command == 'specificity':
             if args.db == 'list':
-                return handleAnnotationList(args)
+                return handleSpecificityList(args)
             if args.db == 'all':
-                return handleAnnotationDownloadAll(args)
+                return handleSpecificityDownloadAll(args)
             # The action and table levels are required subparsers, so argparse
             # has already rejected a commandline missing either.
             if args.action == 'search':
-                return handleAnnotationSearch(args)
+                return handleSpecificitySearch(args)
             if args.action == 'download':
-                return handleAnnotationDownload(args)
+                return handleSpecificityDownload(args)
 
         parser.print_help(sys.stderr)
         return 1

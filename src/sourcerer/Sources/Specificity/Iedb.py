@@ -25,7 +25,7 @@ from pathlib import Path
 import pandas
 
 # Sourcerer imports
-from sourcerer.Annotations.Paginate import pageByRange
+from sourcerer.Sources.Specificity.Paginate import pageByRange
 from sourcerer.Exceptions import IedbParseError
 from sourcerer.Http import hashFile
 from sourcerer.Sources.Base import DataUnit, DownloadResult, SourceBase
@@ -99,7 +99,7 @@ def _findZipMember(archive, filename):
 
 class IedbSource(SourceBase):
     """
-    The IEDB annotation source.
+    The IEDB specificity source.
     """
 
     name = 'iedb'

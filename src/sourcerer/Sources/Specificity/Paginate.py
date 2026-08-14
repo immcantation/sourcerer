@@ -4,8 +4,8 @@ Range-header pagination, for IEDB
 IEDB's query API (https://query-api.iedb.org/api/v1) is PostgREST, which pages
 results through the HTTP `Range` request header rather than a query parameter,
 and signals the end of data with a 416 status rather than an empty page. Kept
-here rather than under Sources/ since only annotation sources page this way so
-far.
+here rather than under Sources/ directly since only specificity sources page
+this way so far.
 """
 
 # Info

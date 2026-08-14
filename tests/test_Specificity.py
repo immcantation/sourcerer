@@ -1,5 +1,5 @@
 """
-Unit tests for annotation sources (IEDB) and the Range-header paginator
+Unit tests for specificity sources (IEDB) and the Range-header paginator
 """
 
 # Info
@@ -16,9 +16,9 @@ from pathlib import Path
 import pandas
 
 # Sourcerer imports
-from sourcerer.Annotations import REGISTRY, getAnnotationSource
-from sourcerer.Annotations.Iedb import API_BASE, BULK_URL, IedbSource
-from sourcerer.Annotations.Paginate import pageByRange
+from sourcerer.Sources.Specificity import REGISTRY, getSpecificitySource
+from sourcerer.Sources.Specificity.Iedb import API_BASE, BULK_URL, IedbSource
+from sourcerer.Sources.Specificity.Paginate import pageByRange
 from sourcerer.Exceptions import HttpError, IedbParseError
 from sourcerer.Http import HttpClient
 from sourcerer.Sources.Base import DataUnit, Query
@@ -112,18 +112,18 @@ def makeZip(members):
 
 class TestIedbSource(unittest.TestCase):
     """
-    Tests for the IEDB annotation source
+    Tests for the IEDB specificity source
     """
 
     def test_registered(self):
         self.assertIs(REGISTRY['iedb'], IedbSource)
         client = makeClient(lambda *a: FakeResponse(200))
-        self.assertIsInstance(getAnnotationSource('iedb', client), IedbSource)
+        self.assertIsInstance(getSpecificitySource('iedb', client), IedbSource)
 
     def test_unknown_source_raises(self):
         client = makeClient(lambda *a: FakeResponse(200))
         with self.assertRaises(KeyError):
-            getAnnotationSource('not-a-real-db', client)
+            getSpecificitySource('not-a-real-db', client)
 
     def test_search_units_returns_one_unit_per_table(self):
         source = IedbSource(makeClient(lambda *a: FakeResponse(200)))

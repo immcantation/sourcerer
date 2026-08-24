@@ -38,12 +38,37 @@ Germline references:
   optional_file trees).
 + Added ``sourcerer reference build``, to validate a germline reference folder
   -- in the ``reference_base`` layout or a flat folder of FASTAs -- and build
-  its IgBLAST databases, with ``--check`` to validate without building.
+  its IgBLAST databases, with ``--check`` to validate without building. The
+  build writes a ``sourcerer_build.yaml`` recording what it produced and carries
+  any ``IMGT.yaml`` / ``AIRRC.yaml`` from the source reference into the
+  ``igblast_base``, so a custom reference keeps its provenance.
++ Added ``--map``, a manifest naming the species and chain of reference files
+  whose own names do not say -- an OGRDB set downloaded as ``IGH_VDJ_V.fasta``,
+  for one. It overrides the naming rule rather than guessing, since a chain
+  inferred wrongly does not fail, it files the alleles under the wrong locus.
+  ``.fa`` and ``.fna`` are read alongside ``.fasta``.
++ Added ``sourcerer reference show``, to report what a reference folder is and
+  where it came from: the release and sets behind it, what was built, and what
+  it holds, read back from the provenance sidecars.
++ A download now records its provenance inside ``reference_base``: ``IMGT.yaml``
+  with the GENE-DB release, and ``AIRRC.yaml`` with each OGRDB set's version and
+  release date, and its Zenodo DOI under ``--resolve-doi``.
++ Added ``download --from <reference>``, to re-download the exact versions a
+  ``reference_base`` was built from: OGRDB sets through the versioned API, and an
+  IMGT release from the genedb-releases_ archive (the nearest release, with a
+  warning, when the exact one is not archived, since IMGT serves only the
+  current build). A substituted release is recorded as one: ``IMGT.yaml`` keeps
+  the release asked for beside the release used, so a later ``--from`` cannot
+  quietly pin the neighbour as though it were the original.
++ Added ``download --compare`` and ``sourcerer reference diff``, to compare two
+  reference folders allele by allele -- identical, added, removed or changed --
+  so a re-downloaded release can be checked against the original.
 + nf-core/airrflow can fetch germlines through ``sourcerer`` for its ``imgt``
   and ``airrc-imgt`` database types, or consume a ``sourcerer``-built reference
   passed to ``--reference_fasta`` / ``--reference_igblast``.
 
 .. _OAS: https://opig.stats.ox.ac.uk/webapps/oas/
+.. _genedb-releases: https://github.com/JamieHeather/genedb-releases
 .. _IMGT: https://www.imgt.org/genedb/
 .. _OGRDB: https://ogrdb.airr-community.org/
 .. _nf-core/airrflow: https://nf-co.re/airrflow

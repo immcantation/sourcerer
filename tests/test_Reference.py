@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 # Sourcerer imports
 from sourcerer import Reference
 from sourcerer.Exceptions import SourcererError
@@ -249,6 +251,255 @@ class TestPlanReference(unittest.TestCase):
             built = {b for b, _t, _r in
                      Reference.planReference(tmp, species=['human']).databases}
             self.assertEqual(built, {'human_ig_v'})
+
+
+class TestMetadata(unittest.TestCase):
+    """
+    Tests for the reference_base provenance sidecars
+    """
+
+    def test_imgt_metadata_records_the_release(self):
+        """IMGT.yaml carries the release, the datum a download date does not."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            path = Reference.writeImgtMetadata(tmp, ['human'], '202631-7',
+                                               '2026-08-14', 'sourcerer 0.1.0')
+            self.assertEqual(path.name, 'IMGT.yaml')
+            pins = Reference.loadReferencePins(tmp)
+            self.assertEqual(pins['imgt']['release'], '202631-7')
+            self.assertIsNone(pins['airrc'])
+
+    def test_airrc_metadata_records_each_set_version(self):
+        """AIRRC.yaml carries a version per set, so --from can re-pin them."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            sets = [{'species': 'human', 'locus': 'IGH', 'set': 'IGH_VDJ',
+                     'version': '3', 'release_date': '2024-01-01'}]
+            Reference.writeAirrcMetadata(tmp, sets, '2026-08-14', 'sourcerer 0.1.0')
+            pins = Reference.loadReferencePins(tmp)
+            self.assertEqual(pins['airrc']['sets'][0]['version'], '3')
+
+    def test_load_pins_reads_both_from_a_blended_reference(self):
+        """A reference_base with both sidecars pins both sources at once."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            Reference.writeImgtMetadata(tmp, ['human'], '202631-7', '2026-08-14',
+                                        'x')
+            Reference.writeAirrcMetadata(tmp, [{'set': 'IGH_VDJ', 'version': '3'}],
+                                         '2026-08-14', 'x')
+            pins = Reference.loadReferencePins(tmp)
+            self.assertIsNotNone(pins['imgt'])
+            self.assertIsNotNone(pins['airrc'])
+
+    def test_load_pins_rejects_a_folder_without_sidecars(self):
+        """--from a folder that holds neither sidecar is an error, not a no-op."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SourcererError):
+                Reference.loadReferencePins(Path(tmp))
+
+    def test_build_metadata_records_the_build_and_carries_provenance(self):
+        """reference build writes a build record and carries the IMGT sidecar in."""
+        with tempfile.TemporaryDirectory() as src, \
+                tempfile.TemporaryDirectory() as out:
+            src, out = Path(src), Path(out)
+            Reference.writeImgtMetadata(src, ['human'], '202631-7', '2026-08-14',
+                                        'x')
+            report = Reference.ReferenceReport(built=['human_ig_v'],
+                                               skipped_empty=['human_tr_d'])
+
+            written = Reference.writeBuildMetadata(out, report, src, '2026-08-14',
+                                                   'sourcerer 0.1.0')
+            self.assertIn(out / 'IMGT.yaml', written)  # carried forward
+            record = yaml.safe_load((out / 'sourcerer_build.yaml').read_text())
+            self.assertEqual(record['databases'], ['human_ig_v'])
+            # Recorded relative to the built directory, so moving the pair keeps
+            # the link; resolving it from there must land back on the source.
+            self.assertFalse(Path(record['built_from']).is_absolute())
+            self.assertEqual((out / record['built_from']).resolve(),
+                             src.resolve())
+
+
+class TestReferenceMap(unittest.TestCase):
+    """
+    Tests for the manifest that names files the naming rule cannot place
+    """
+
+    MANIFEST = ('# file\tspecies\tchain\n'
+                '\n'
+                'IGH_VDJ_V.fasta\thuman\tIGHV\n'
+                'C57BL-6_IGH_V.fasta\tmouse\tIGHV\n'
+                'translated.fasta\thuman\tIGHV\taa\n')
+
+    def writeManifest(self, tmp, text=None):
+        path = Path(tmp) / 'manifest.tsv'
+        path.write_text(self.MANIFEST if text is None else text)
+        return path
+
+    def test_reads_species_chain_and_the_aa_marker(self):
+        """Three columns place a file; a fourth marks it as translated V."""
+        with tempfile.TemporaryDirectory() as tmp:
+            mapping = Reference.loadReferenceMap(self.writeManifest(tmp))
+        self.assertEqual(mapping['IGH_VDJ_V.fasta'], ('human', 'IGHV', False))
+        self.assertEqual(mapping['C57BL-6_IGH_V.fasta'], ('mouse', 'IGHV', False))
+        self.assertEqual(mapping['translated.fasta'], ('human', 'IGHV', True))
+
+    def test_unknown_species_or_chain_is_an_error(self):
+        """A manifest exists to be explicit, so a bad row fails rather than skips."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for bad in ('a.fasta\tmartian\tIGHV\n', 'a.fasta\thuman\tIGXV\n',
+                        'a.fasta\thuman\n'):
+                path = self.writeManifest(tmp, bad)
+                with self.assertRaises(SourcererError):
+                    Reference.loadReferenceMap(path)
+
+    def test_manifest_places_a_file_the_naming_rule_skips(self):
+        """A file with no species or chain in its name is found via the manifest."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / 'IGH_VDJ_V.fasta').write_text('>IGHV1-2*02\nACGT\n')
+            files, unrecognized = Reference.discoverReference(tmp)
+            self.assertEqual(files, [])
+            self.assertEqual(len(unrecognized), 1)
+
+            mapping = Reference.loadReferenceMap(self.writeManifest(tmp))
+            files, unrecognized = Reference.discoverReference(tmp, mapping=mapping)
+            self.assertEqual(unrecognized, [])
+            self.assertEqual(files[0][:3], ('human', 'IGHV', False))
+
+    def test_manifest_overrides_a_name_that_would_parse(self):
+        """The manifest wins, so it can correct a misread name, not only place one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / 'imgt_human_IGHV.fasta').write_text('>IGHV1-2*02\nACGT\n')
+            path = self.writeManifest(
+                tmp, 'imgt_human_IGHV.fasta\tmouse\tIGKV\n')
+            mapping = Reference.loadReferenceMap(path)
+            files, _ = Reference.discoverReference(tmp, mapping=mapping)
+        self.assertEqual(files[0][:3], ('mouse', 'IGKV', False))
+
+    def test_other_fasta_extensions_are_read(self):
+        """A manifest is no use if the file it names is never looked at."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / 'human_IGHV.fa').write_text('>IGHV1-2*02\nACGT\n')
+            (tmp / 'human_IGHJ.fna').write_text('>IGHJ4*02\nACGT\n')
+            files, unrecognized = Reference.discoverReference(tmp)
+        self.assertEqual(unrecognized, [])
+        self.assertEqual({f[1] for f in files}, {'IGHV', 'IGHJ'})
+
+
+class TestDescribeReference(unittest.TestCase):
+    """
+    Tests for reporting what a reference folder is and where it came from
+    """
+
+    def build(self, tmp):
+        root = Path(tmp) / 'reference_base'
+        (root / 'human' / 'vdj').mkdir(parents=True)
+        (root / 'human' / 'vdj' / 'imgt_human_IGHV.fasta').write_text(
+            '>X1|IGHV1-2*02|Homo_sapiens|F\nACGT\n')
+        return root
+
+    def test_reports_the_release_and_the_contents(self):
+        """The sidecar and the FASTAs present are both reported."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.build(tmp)
+            Reference.writeImgtMetadata(root, ['human'], '202631-7',
+                                        '2026-08-24', 'sourcerer test')
+            text = Reference.describeReference(root)
+        self.assertIn('202631-7', text)
+        self.assertIn('IGHV', text)
+        self.assertIn('1 FASTA file(s)', text)
+
+    def test_accepts_the_directory_holding_a_reference_base(self):
+        """Pointing at the download root finds the reference_base inside it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.build(tmp)
+            Reference.writeImgtMetadata(root, ['human'], '202631-7',
+                                        '2026-08-24', 'sourcerer test')
+            text = Reference.describeReference(Path(tmp))
+        self.assertIn('202631-7', text)
+
+    def test_a_folder_without_sidecars_says_so(self):
+        """A hand-assembled folder is described, not rejected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            text = Reference.describeReference(self.build(tmp))
+        self.assertIn('no provenance sidecars', text)
+        self.assertIn('IGHV', text)
+
+
+class TestInexactRelease(unittest.TestCase):
+    """
+    Tests for recording a release the archive did not hold exactly
+    """
+
+    def test_plain_download_records_no_request(self):
+        """A download of the current release has nothing to have asked for."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Reference.writeImgtMetadata(Path(tmp), ['human'], '202631-7',
+                                               '2026-08-24', 'x')
+            record = yaml.safe_load(path.read_text())
+        self.assertNotIn('requested', record)
+        self.assertNotIn('exact', record)
+
+    def test_substituted_release_records_what_was_asked_for(self):
+        """A neighbouring release is recorded as a substitute, not as the original."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Reference.writeImgtMetadata(
+                Path(tmp), ['human'], '202630-7', '2026-08-24', 'x',
+                requested='202629-7', exact=False)
+            record = yaml.safe_load(path.read_text())
+        self.assertEqual(record['release'], '202630-7')
+        self.assertEqual(record['requested'], '202629-7')
+        self.assertFalse(record['exact'])
+
+
+class TestDiff(unittest.TestCase):
+    """
+    Tests for comparing two reference folders allele by allele
+    """
+
+    def _write(self, root, name, text):
+        path = Path(root) / name
+        path.write_text(text)
+
+    def test_identical_references_are_reported_same(self):
+        """Two folders with the same alleles and sequences compare equal."""
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            self._write(a, 'human_IGHV.fasta', '>IGHV1-2*02\nACGTACGT\n')
+            self._write(b, 'human_IGHV.fasta', '>IGHV1-2*02\nACGTACGT\n')
+            diff = Reference.diffReference(a, b)
+            self.assertTrue(diff.same)
+            self.assertEqual(diff.chains[0].identical, 1)
+
+    def test_gaps_and_case_do_not_count_as_a_difference(self):
+        """A gapped, lower-case copy of an allele is not a false change."""
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            self._write(a, 'human_IGHV.fasta', '>IGHV1-2*02\nAC..GTACGT\n')
+            self._write(b, 'human_IGHV.fasta', '>IGHV1-2*02\nacgtacgt\n')
+            self.assertTrue(Reference.diffReference(a, b).same)
+
+    def test_added_removed_and_changed_are_classified(self):
+        """Each kind of divergence lands in the right bucket."""
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            self._write(a, 'human_IGHV.fasta',
+                        '>IGHV1-2*02\nACGT\n>IGHV3-7*01\nTTTT\n')
+            self._write(b, 'human_IGHV.fasta',
+                        '>IGHV1-2*02\nACGG\n>IGHV4-4*01\nGGGG\n')
+            diff = Reference.diffReference(a, b)
+            self.assertFalse(diff.same)
+            chain = diff.chains[0]
+            self.assertEqual(chain.changed, ['IGHV1-2*02'])
+            self.assertEqual(chain.added, ['IGHV4-4*01'])
+            self.assertEqual(chain.removed, ['IGHV3-7*01'])
+
+    def test_imgt_pipe_headers_align_with_bare_names(self):
+        """An IMGT pipe header and a bare OGRDB name for one allele line up."""
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            self._write(a, 'imgt_human_IGHV.fasta',
+                        '>X02897|IGHV1-2*02|Homo_sapiens|F\nACGT\n')
+            self._write(b, 'airrc_human_IGHV.fasta', '>IGHV1-2*02\nACGT\n')
+            self.assertTrue(Reference.diffReference(a, b).same)
 
 
 if __name__ == '__main__':

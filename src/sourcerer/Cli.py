@@ -185,6 +185,42 @@ def _addReferenceParser(commands):
                        default=None,
                        help='limit to these species; default is every species '
                             'found in the folder')
+    build.add_argument('--map', dest='map_file', type=Path, default=None,
+                       metavar='MANIFEST', help='a manifest declaring the species and chain of files whose names do not say, one per line: <file> <species> <CHAIN> [aa]. It overrides the naming rule, so it can also correct a file the rule misreads')
+
+    diff = actions.add_parser(
+        'diff', help='compare two germline reference folders allele by allele',
+        description='Compare two reference folders allele by allele and report '
+                    'what is identical, added, removed or changed. Files are '
+                    'matched by name in any layout, and sequences are compared '
+                    'without gaps, so a gapped and an ungapped copy of the same '
+                    'allele are not a false difference. Exits non-zero when the '
+                    'two references differ.',
+        formatter_class=CommonHelpFormatter)
+    diff.add_argument('reference_a', type=Path,
+                      help='the baseline reference folder')
+    diff.add_argument('reference_b', type=Path,
+                      help='the reference folder to compare against it')
+    diff.add_argument('--species', nargs='+', choices=list(Reference.SPECIES),
+                      default=None,
+                      help='limit to these species; default is every species '
+                           'found in either folder')
+    diff.add_argument('--map', dest='map_file', type=Path, default=None,
+                      metavar='MANIFEST', help='a manifest declaring the species and chain of files whose names do not say, one per line: <file> <species> <CHAIN> [aa]. It overrides the naming rule, so it can also correct a file the rule misreads')
+
+    show = actions.add_parser(
+        'show', help='report what a reference folder is and where it came from',
+        description='Read a reference folder\'s provenance sidecars -- '
+                    'IMGT.yaml, AIRRC.yaml and sourcerer_build.yaml -- and '
+                    'report the release and sets it was built from, what was '
+                    'built, and what the folder holds. Accepts a reference_base, '
+                    'a directory containing one, or an igblast_base, which '
+                    'carries copies of the same sidecars.',
+        formatter_class=CommonHelpFormatter)
+    show.add_argument('folder', type=Path,
+                      help='the reference folder to describe')
+    show.add_argument('--map', dest='map_file', type=Path, default=None,
+                      metavar='MANIFEST', help='a manifest declaring the species and chain of files whose names do not say, one per line: <file> <species> <CHAIN> [aa]. It overrides the naming rule, so it can also correct a file the rule misreads')
 
 
 def _addSchemaParser(commands):
@@ -308,6 +344,22 @@ def _addSourceParser(commands, name, source):
                     leaf.add_argument('--igblast-out', type=Path, default=None,
                                       help='where to write igblast_base; '
                                            'defaults to <outdir>/igblast_base')
+                    leaf.add_argument('--from', dest='from_ref', type=Path,
+                                      default=None, metavar='REFERENCE',
+                                      help='re-download the versions pinned in a '
+                                           'reference_base (its IMGT.yaml / '
+                                           'AIRRC.yaml), or one of those files, '
+                                           'instead of the latest')
+                    leaf.add_argument('--compare', type=Path, default=None,
+                                      metavar='REFERENCE',
+                                      help='after building, compare the result '
+                                           'allele by allele against this '
+                                           'reference folder and report; a '
+                                           'difference is a non-zero exit')
+                    leaf.add_argument('--resolve-doi', action='store_true',
+                                      help='resolve each OGRDB set\'s Zenodo DOI '
+                                           'into AIRRC.yaml (scrapes the OGRDB '
+                                           'web UI; ignored by imgt)')
                 else:
                     leaf.add_argument('--format', action='append', dest='formats',
                                       choices=FORMATS,
@@ -443,12 +495,54 @@ def handleSearch(args):
     return 0
 
 
+def loadMap(args):
+    """
+    Read the --map manifest, if one was given.
+
+    Arguments:
+      args (Namespace): parsed arguments.
+
+    Returns:
+      dict: the manifest, or None.
+    """
+    if getattr(args, 'map_file', None) is None:
+        return None
+
+    return Reference.loadReferenceMap(args.map_file)
+
+
+def handleReferenceDiff(args):
+    """Compare two reference folders and report; non-zero exit if they differ."""
+    for folder in (args.reference_a, args.reference_b):
+        if not folder.is_dir():
+            raise SourcererError('no such reference folder: %s' % folder)
+
+    diff = Reference.diffReference(args.reference_a, args.reference_b,
+                                   species=args.species, mapping=loadMap(args))
+    print(diff.summary())
+
+    return 0 if diff.same else 1
+
+
+def handleReferenceShow(args):
+    """Report what a reference folder is and where it came from."""
+    print(Reference.describeReference(args.folder, mapping=loadMap(args)))
+
+    return 0
+
+
 def handleReference(args):
     """Validate a reference folder and, unless --check, build its IgBLAST base."""
+    if args.action == 'diff':
+        return handleReferenceDiff(args)
+    if args.action == 'show':
+        return handleReferenceShow(args)
+
     if not args.folder.is_dir():
         raise SourcererError('no such reference folder: %s' % args.folder)
 
-    plan = Reference.planReference(args.folder, species=args.species)
+    plan = Reference.planReference(args.folder, species=args.species,
+                                   mapping=loadMap(args))
     print(plan.summary())
 
     if not plan.ok:
@@ -462,14 +556,56 @@ def handleReference(args):
         raise SourcererError('--out is required to build; pass --check to only '
                              'validate the folder')
 
-    Reference.buildFromPlan(plan, args.out, makeClient(args))
+    report = Reference.buildFromPlan(plan, args.out, makeClient(args))
+    for path in Reference.writeBuildMetadata(
+            args.out, report, args.folder, Provenance.timestamp()[:10],
+            'sourcerer %s' % __version__):
+        log.info('wrote %s', path)
     log.info('wrote %s', args.out)
 
     return 0
 
 
+def applyPins(source, from_ref):
+    """
+    Pin a reference source to the versions recorded in a reference_base.
+
+    Reads the IMGT.yaml / AIRRC.yaml at --from and applies whichever pins the
+    source can act on, so an imgt source takes the IMGT release, an ogrdb source
+    the set versions, and the blend both. A --from whose pins none of the source
+    can use is a mistake worth stopping on rather than silently fetching latest.
+
+    Arguments:
+      source (ReferenceSource): the source about to download.
+      from_ref (Path): a reference_base or an IMGT.yaml/AIRRC.yaml file.
+    """
+    from sourcerer.Sources.Germline import ReferenceSource
+
+    pins = Reference.loadReferencePins(from_ref)
+    imgt, airrc = pins.get('imgt'), pins.get('airrc')
+    can_release = type(source).pinRelease is not ReferenceSource.pinRelease
+
+    applied = []
+    if imgt and imgt.get('release') and can_release:
+        source.pinRelease(imgt['release'])
+        applied.append('IMGT release %s' % imgt['release'])
+    if airrc and airrc.get('sets') and hasattr(source, 'pinSets'):
+        source.pinSets(airrc['sets'])
+        applied.append('%d OGRDB set version(s)' % len(airrc['sets']))
+
+    if not applied:
+        raise SourcererError('the reference at %s has no versions %s can '
+                             're-download' % (from_ref, source.name))
+    log.info('re-downloading pinned: %s', '; '.join(applied))
+
+
 def handleReferenceDownload(args, source):
     """Download germline sets and build an airrflow reference_base."""
+    if args.from_ref is not None:
+        applyPins(source, args.from_ref)
+    if args.resolve_doi and hasattr(source, 'enableDoi'):
+        source.enableDoi()
+
     query = source.validateQuery(args.collection, collectFilters(args))
     if args.limit is not None:
         query = type(query)(collection=query.collection, filters=query.filters,
@@ -496,13 +632,18 @@ def handleReferenceDownload(args, source):
 
     reference_dir = outdir / 'reference_base'
     source.buildReference(entries, reference_dir).logSummary()
+    for path in source.writeReferenceMetadata(reference_dir, units):
+        log.info('wrote %s', path)
     log.info('wrote %s', reference_dir)
 
     formats = ['reference']
     if args.igblast:
         igblast_out = args.igblast_out or (outdir / 'igblast_base')
-        Reference.buildIgblastBase(reference_dir, igblast_out, source.client,
-                                   species=[args.collection])
+        report = Reference.buildIgblastBase(reference_dir, igblast_out,
+                                            source.client, species=[args.collection])
+        Reference.writeBuildMetadata(igblast_out, report, reference_dir,
+                                     Provenance.timestamp()[:10],
+                                     'sourcerer %s' % __version__)
         log.info('wrote %s', igblast_out)
         formats.append('igblast')
 
@@ -511,6 +652,16 @@ def handleReferenceDownload(args, source):
         formats, provenance, schema=source.schema, license=source.license,
         citation=source.citation)
     log.info('wrote %s', record)
+
+    if args.compare is not None:
+        if not args.compare.is_dir():
+            raise SourcererError('no such reference folder: %s' % args.compare)
+        diff = Reference.diffReference(args.compare, reference_dir,
+                                       species=[args.collection])
+        print(diff.summary())
+        if not diff.same:
+            log.warning('the built reference differs from %s', args.compare)
+            return 1
 
     return 0
 

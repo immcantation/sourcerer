@@ -6,6 +6,7 @@ Unit tests for the commandline interface
 __author__ = 'Susanna Marquez'
 
 # Imports
+import contextlib
 import io
 import shutil
 import tempfile
@@ -17,9 +18,20 @@ from unittest import mock
 import pandas
 
 # Sourcerer imports
-from sourcerer.Cli import getArgParser, handleDownload
+from sourcerer import Reference
+from sourcerer.Cli import (
+    applyPins,
+    getArgParser,
+    handleDownload,
+    handleReferenceDiff,
+    handleReferenceShow,
+    loadMap,
+)
+from sourcerer.Exceptions import SourcererError
 from sourcerer.Sources.Base import DataUnit, DownloadResult, Query, SourceBase
+from sourcerer.Sources.Imgt import ImgtSource
 from sourcerer.Sources.Oas import OasSource, newReport
+from sourcerer.Sources.Ogrdb import OgrdbSource
 
 
 class TestArgParser(unittest.TestCase):
@@ -247,6 +259,143 @@ class TestHandleDownload(unittest.TestCase):
 
         self.assertTrue((self.outdir / 'samplesheet_airrflow_airr.tsv').exists())
         self.assertTrue((self.outdir / 'samplesheet_airrflow_fasta.tsv').exists())
+
+
+def makeReference(root, chain='IGHV', records=(('IGHV1-2*02', 'ACGT'),)):
+    """Write a minimal reference_base and return its root."""
+    root = Path(root)
+    (root / 'human' / 'vdj').mkdir(parents=True, exist_ok=True)
+    path = root / 'human' / 'vdj' / ('imgt_human_%s.fasta' % chain)
+    path.write_text(''.join('>%s\n%s\n' % record for record in records))
+
+    return root
+
+
+class TestApplyPins(unittest.TestCase):
+    """
+    Tests for routing a --from reference's pins to the source that can use them
+    """
+
+    def writePins(self, tmp, imgt=True, airrc=True):
+        root = Path(tmp)
+        if imgt:
+            Reference.writeImgtMetadata(root, ['human'], '202631-7',
+                                        '2026-08-24', 'x')
+        if airrc:
+            Reference.writeAirrcMetadata(
+                root, [{'species': 'human', 'locus': 'IGH', 'set': 'IGH_VDJ',
+                        'version': '9', 'release_date': '2024-10-12'}],
+                '2026-08-24', 'x')
+        return root
+
+    def test_imgt_takes_the_release(self):
+        """An imgt source is pinned to the release the reference records."""
+        with tempfile.TemporaryDirectory() as tmp:
+            source = ImgtSource(client=None)
+            applyPins(source, self.writePins(tmp))
+        self.assertEqual(source.release, '202631-7')
+
+    def test_ogrdb_takes_the_set_versions(self):
+        """An ogrdb source is pinned to each set version, keyed by set name."""
+        with tempfile.TemporaryDirectory() as tmp:
+            source = OgrdbSource(client=None)
+            applyPins(source, self.writePins(tmp))
+        self.assertEqual(source._pins['IGH_VDJ']['version'], '9')
+
+    def test_ogrdb_ignores_a_release_it_cannot_re_download(self):
+        """An IMGT-only reference gives an ogrdb source nothing, and says so."""
+        with tempfile.TemporaryDirectory() as tmp:
+            source = OgrdbSource(client=None)
+            with self.assertRaises(SourcererError):
+                applyPins(source, self.writePins(tmp, airrc=False))
+
+    def test_a_folder_with_no_sidecars_is_an_error(self):
+        """--from pointed at an ordinary folder fails rather than fetching latest."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SourcererError):
+                applyPins(ImgtSource(client=None), Path(tmp))
+
+
+class TestReferenceDiffCommand(unittest.TestCase):
+    """
+    Tests for the exit code `reference diff` reports
+    """
+
+    def run_diff(self, a, b, map_file=None):
+        args = mock.Mock(reference_a=a, reference_b=b, species=None,
+                         map_file=map_file)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = handleReferenceDiff(args)
+        return code, out.getvalue()
+
+    def test_identical_references_exit_zero(self):
+        """Nothing changed is a success, and says so."""
+        with tempfile.TemporaryDirectory() as tmp:
+            a = makeReference(Path(tmp) / 'a')
+            b = makeReference(Path(tmp) / 'b')
+            code, text = self.run_diff(a, b)
+        self.assertEqual(code, 0)
+        self.assertIn('identical', text)
+
+    def test_differing_references_exit_non_zero(self):
+        """A difference is a non-zero exit, so a re-download can be checked in CI."""
+        with tempfile.TemporaryDirectory() as tmp:
+            a = makeReference(Path(tmp) / 'a')
+            b = makeReference(Path(tmp) / 'b',
+                              records=(('IGHV1-2*02', 'TTTT'),))
+            code, text = self.run_diff(a, b)
+        self.assertEqual(code, 1)
+        self.assertIn('changed', text)
+
+    def test_a_missing_folder_is_an_error(self):
+        """A path that is not a folder fails rather than comparing nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            a = makeReference(Path(tmp) / 'a')
+            with self.assertRaises(SourcererError):
+                self.run_diff(a, Path(tmp) / 'nope')
+
+
+class TestReferenceShowCommand(unittest.TestCase):
+    """
+    Tests for reporting what a reference folder is
+    """
+
+    def test_reports_the_release_and_contents(self):
+        """show prints the pinned release and the chains the folder holds."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = makeReference(Path(tmp) / 'reference_base')
+            Reference.writeImgtMetadata(root, ['human'], '202631-7',
+                                        '2026-08-24', 'x')
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = handleReferenceShow(mock.Mock(folder=root, map_file=None))
+        self.assertEqual(code, 0)
+        self.assertIn('202631-7', out.getvalue())
+        self.assertIn('IGHV', out.getvalue())
+
+
+class TestLoadMap(unittest.TestCase):
+    """
+    Tests for reading the --map manifest off the commandline
+    """
+
+    def test_no_manifest_is_none(self):
+        """--map is optional; without it nothing is declared."""
+        self.assertIsNone(loadMap(mock.Mock(map_file=None)))
+
+    def test_a_missing_manifest_is_an_error(self):
+        """A manifest that is not there fails rather than being ignored."""
+        with self.assertRaises(SourcererError):
+            loadMap(mock.Mock(map_file=Path('/nonexistent/manifest.tsv')))
+
+    def test_a_manifest_is_read(self):
+        """The declared files come back keyed by name."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'manifest.tsv'
+            path.write_text('IGH_VDJ_V.fasta\thuman\tIGHV\n')
+            mapping = loadMap(mock.Mock(map_file=path))
+        self.assertEqual(mapping['IGH_VDJ_V.fasta'], ('human', 'IGHV', False))
 
 
 if __name__ == '__main__':

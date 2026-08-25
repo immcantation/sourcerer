@@ -35,7 +35,10 @@ Germline references:
 + Added ``sourcerer <source> download <species>``, which writes the germline
   ``reference_base`` in the `nf-core/airrflow`_ layout, and ``--igblast`` to also
   build the IgBLAST databases (``makeblastdb`` plus the NCBI internal_data and
-  optional_file trees).
+  optional_file trees). ``download all`` fetches every species the source covers
+  into one ``reference_base``, with one ``IMGT.yaml`` and one ``AIRRC.yaml``
+  describing the whole of it. The OAS source has no equivalent: its collections
+  are paired and unpaired, which have different fields and different outputs.
 + Added ``sourcerer reference build``, to validate a germline reference folder
   -- in the ``reference_base`` layout or a flat folder of FASTAs -- and build
   its IgBLAST databases, with ``--check`` to validate without building. The
@@ -67,7 +70,12 @@ Germline references:
   rows rather than building the file itself.
 + A download now records its provenance inside ``reference_base``: ``IMGT.yaml``
   with the GENE-DB release, and ``AIRRC.yaml`` with each OGRDB set's version and
-  release date, and its Zenodo DOI under ``--resolve-doi``.
+  release date, and its Zenodo DOI under ``--resolve-doi``. A download fetches
+  one species but a ``reference_base`` holds as many as were downloaded into it,
+  so both sidecars merge rather than replace: downloading mouse into a folder
+  that already holds human keeps human. The IMGT release is recorded per
+  species, since the two can be fetched weeks apart from different builds, and
+  ``--from`` pins only the species being downloaded.
 + Added ``download --from <reference>``, to re-download the exact versions a
   ``reference_base`` was built from: OGRDB sets through the versioned API, and an
   IMGT release from the genedb-releases_ archive (the nearest release, with a

@@ -545,22 +545,27 @@ def discoverReference(reference_dir, mapping=None):
 def writeImgtMetadata(reference_dir, species, release, date, generated_by,
                       requested=None, exact=True):
     """
-    Record which IMGT release a reference_base was built from.
+    Record which IMGT release each species in a reference_base was built from.
 
     Written inside reference_base as IMGT.yaml so the release travels with the
     FASTAs. The release is the one datum a download date does not carry and the
     one `download --from` needs to fetch the same version again.
 
-    When the release was reconstructed from the archive, what was asked for is
+    A download fetches one species, but a reference_base holds as many as were
+    downloaded into it, so this merges rather than replaces: writing mouse into
+    a folder that already has human leaves human alone. The release is recorded
+    per species because the two can be downloaded weeks apart, from different
+    IMGT builds, and a single release field would then misname one of them.
+
+    When a release was reconstructed from the archive, what was asked for is
     recorded beside what was found. The archive does not hold every IMGT build,
-    so a pinned re-download can land on a neighbouring release; writing only the
-    release actually used would present that substitute as though it were the one
-    requested, and a later `--from` would pin the substitute in turn. `exact`
-    says which happened, and is what makes `--compare` worth running.
+    so a pinned re-download can land on a neighbouring release; recording only
+    the release used would present that substitute as the one requested, and a
+    later `--from` would pin the substitute in turn.
 
     Arguments:
       reference_dir (Path): the reference_base root.
-      species (iterable): the species present, e.g. ('human',).
+      species (iterable): the species this download wrote, e.g. ('human',).
       release (str): the IMGT GENE-DB release tag used, e.g. '202631-7', or ''.
       date (str): the download date, YYYY-MM-DD.
       generated_by (str): the tool and version that wrote it.
@@ -571,16 +576,20 @@ def writeImgtMetadata(reference_dir, species, release, date, generated_by,
     Returns:
       Path: the file written.
     """
-    record = {'source': 'https://www.imgt.org/genedb',
-              'generated_by': generated_by,
-              'date': date,
-              'release': release or None}
-    if requested is not None:
-        record['requested'] = requested
-        record['exact'] = bool(exact)
-    record['species'] = list(species)
+    path = Path(reference_dir) / IMGT_METADATA
+    record = _loadMetadata(path) or {'source': 'https://www.imgt.org/genedb'}
+    record['generated_by'] = generated_by
+    known = dict(record.get('species') or {})
 
-    return _writeMetadata(Path(reference_dir) / IMGT_METADATA, record)
+    for name in species:
+        entry = {'release': release or None, 'date': date}
+        if requested is not None:
+            entry['requested'] = requested
+            entry['exact'] = bool(exact)
+        known[name] = entry
+    record['species'] = {name: known[name] for name in sorted(known)}
+
+    return _writeMetadata(path, record)
 
 
 def writeAirrcMetadata(reference_dir, sets, date, generated_by):
@@ -590,6 +599,11 @@ def writeAirrcMetadata(reference_dir, sets, date, generated_by):
     Written inside reference_base as AIRRC.yaml. Each set keeps its version and
     release date, and its DOI when it was resolved, so the exact sets can be
     fetched again with `download --from` and cited.
+
+    A download fetches one species, but a reference_base holds as many as were
+    downloaded into it, so this merges on (species, set): a species downloaded
+    later joins the ones already recorded, and re-downloading a set replaces its
+    entry rather than adding a second one.
 
     Arguments:
       reference_dir (Path): the reference_base root.
@@ -601,12 +615,40 @@ def writeAirrcMetadata(reference_dir, sets, date, generated_by):
     Returns:
       Path: the file written.
     """
-    record = {'source': 'https://ogrdb.airr-community.org',
-              'generated_by': generated_by,
-              'date': date,
-              'sets': list(sets)}
+    path = Path(reference_dir) / AIRRC_METADATA
+    record = _loadMetadata(path) or {'source': 'https://ogrdb.airr-community.org'}
+    record['generated_by'] = generated_by
+    record['date'] = date
 
-    return _writeMetadata(Path(reference_dir) / AIRRC_METADATA, record)
+    known = {(item.get('species'), item.get('set')): item
+             for item in record.get('sets') or []}
+    known.update({(item.get('species'), item.get('set')): item for item in sets})
+    record['sets'] = [known[key] for key in sorted(known, key=lambda k: (k[0] or '',
+                                                                        k[1] or ''))]
+
+    return _writeMetadata(path, record)
+
+
+def _loadMetadata(path):
+    """
+    Read a provenance sidecar if it is there, so a write can merge into it.
+
+    Arguments:
+      path (Path): the sidecar.
+
+    Returns:
+      dict: the record, or None if there is nothing readable to merge with.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        with open(path) as handle:
+            return yaml.safe_load(handle) or None
+    except (OSError, yaml.YAMLError):
+        log.warning('%s is unreadable; rewriting it from this download alone',
+                    path.name)
+        return None
 
 
 def _writeMetadata(path, record):

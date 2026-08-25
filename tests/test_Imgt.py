@@ -193,9 +193,10 @@ class TestArchivePin(unittest.TestCase):
             tmp = Path(tmp)
             source.writeReferenceMetadata(tmp, units)
             record = yaml.safe_load((tmp / 'IMGT.yaml').read_text())
-        self.assertEqual(record['release'], '202631-7')
-        self.assertEqual(record['requested'], '202629-7')
-        self.assertFalse(record['exact'])
+        entry = record['species']['human']
+        self.assertEqual(entry['release'], '202631-7')
+        self.assertEqual(entry['requested'], '202629-7')
+        self.assertFalse(entry['exact'])
 
     def test_build_from_archive_splits_the_bulk_into_chains(self):
         """A bulk file is filtered and split into per-chain reference FASTAs."""
@@ -257,8 +258,9 @@ class TestReleaseCapture(unittest.TestCase):
             source.writeReferenceMetadata(tmp, units)
             record = yaml.safe_load((tmp / 'IMGT.yaml').read_text())
 
-        self.assertEqual(record['release'], '202631-7')
-        self.assertNotIn('requested', record)    # nothing was pinned
+        entry = record['species']['human']
+        self.assertEqual(entry['release'], '202631-7')
+        self.assertNotIn('requested', entry)    # nothing was pinned
 
     def test_no_units_writes_no_sidecar(self):
         """A source that fetched nothing has no release to record."""

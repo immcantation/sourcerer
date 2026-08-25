@@ -266,7 +266,8 @@ class TestMetadata(unittest.TestCase):
                                                '2026-08-14', 'sourcerer 0.1.0')
             self.assertEqual(path.name, 'IMGT.yaml')
             pins = Reference.loadReferencePins(tmp)
-            self.assertEqual(pins['imgt']['release'], '202631-7')
+            self.assertEqual(pins['imgt']['species']['human']['release'],
+                             '202631-7')
             self.assertIsNone(pins['airrc'])
 
     def test_airrc_metadata_records_each_set_version(self):
@@ -565,8 +566,10 @@ class TestInexactRelease(unittest.TestCase):
             path = Reference.writeImgtMetadata(Path(tmp), ['human'], '202631-7',
                                                '2026-08-24', 'x')
             record = yaml.safe_load(path.read_text())
-        self.assertNotIn('requested', record)
-        self.assertNotIn('exact', record)
+        entry = record['species']['human']
+        self.assertEqual(entry['release'], '202631-7')
+        self.assertNotIn('requested', entry)
+        self.assertNotIn('exact', entry)
 
     def test_substituted_release_records_what_was_asked_for(self):
         """A neighbouring release is recorded as a substitute, not as the original."""
@@ -575,9 +578,70 @@ class TestInexactRelease(unittest.TestCase):
                 Path(tmp), ['human'], '202630-7', '2026-08-24', 'x',
                 requested='202629-7', exact=False)
             record = yaml.safe_load(path.read_text())
-        self.assertEqual(record['release'], '202630-7')
-        self.assertEqual(record['requested'], '202629-7')
-        self.assertFalse(record['exact'])
+        entry = record['species']['human']
+        self.assertEqual(entry['release'], '202630-7')
+        self.assertEqual(entry['requested'], '202629-7')
+        self.assertFalse(entry['exact'])
+
+
+class TestMetadataMerge(unittest.TestCase):
+    """
+    Tests that a second species downloaded into one reference_base is kept
+    """
+
+    def test_a_second_species_does_not_erase_the_first(self):
+        """A download writes one species; the folder holds every one written."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            Reference.writeImgtMetadata(tmp, ['human'], '202631-7', '2026-08-24', 'x')
+            path = Reference.writeImgtMetadata(tmp, ['mouse'], '202638-7',
+                                               '2026-09-24', 'x')
+            record = yaml.safe_load(path.read_text())
+        self.assertEqual(sorted(record['species']), ['human', 'mouse'])
+        # Recorded per species: the two were downloaded from different builds.
+        self.assertEqual(record['species']['human']['release'], '202631-7')
+        self.assertEqual(record['species']['mouse']['release'], '202638-7')
+
+    def test_re_downloading_a_species_replaces_only_its_entry(self):
+        """Fetching human again updates human and leaves mouse untouched."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            Reference.writeImgtMetadata(tmp, ['human'], '202631-7', '2026-08-24', 'x')
+            Reference.writeImgtMetadata(tmp, ['mouse'], '202638-7', '2026-09-24', 'x')
+            path = Reference.writeImgtMetadata(tmp, ['human'], '202640-1',
+                                               '2026-10-01', 'x')
+            record = yaml.safe_load(path.read_text())
+        self.assertEqual(record['species']['human']['release'], '202640-1')
+        self.assertEqual(record['species']['mouse']['release'], '202638-7')
+
+    def test_airrc_sets_from_both_species_are_kept(self):
+        """The mouse download joins the human sets rather than replacing them."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            Reference.writeAirrcMetadata(tmp, [{'species': 'human', 'locus': 'IGH',
+                                                'set': 'IGH_VDJ', 'version': '10'}],
+                                         '2026-08-24', 'x')
+            path = Reference.writeAirrcMetadata(
+                tmp, [{'species': 'mouse', 'locus': 'IGK',
+                       'set': 'IGKJ (all strains)', 'version': '1'}],
+                '2026-09-24', 'x')
+            record = yaml.safe_load(path.read_text())
+        self.assertEqual([(s['species'], s['set']) for s in record['sets']],
+                         [('human', 'IGH_VDJ'), ('mouse', 'IGKJ (all strains)')])
+
+    def test_re_downloading_a_set_updates_it_in_place(self):
+        """A newer version of a set replaces its entry, it does not duplicate it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            Reference.writeAirrcMetadata(tmp, [{'species': 'human', 'locus': 'IGH',
+                                                'set': 'IGH_VDJ', 'version': '9'}],
+                                         '2026-08-24', 'x')
+            path = Reference.writeAirrcMetadata(
+                tmp, [{'species': 'human', 'locus': 'IGH', 'set': 'IGH_VDJ',
+                       'version': '10'}], '2026-09-24', 'x')
+            record = yaml.safe_load(path.read_text())
+        self.assertEqual(len(record['sets']), 1)
+        self.assertEqual(record['sets'][0]['version'], '10')
 
 
 class TestDiff(unittest.TestCase):

@@ -50,6 +50,21 @@ Germline references:
 + Added ``sourcerer reference show``, to report what a reference folder is and
   where it came from: the release and sets behind it, what was built, and what
   it holds, read back from the provenance sidecars.
++ An allele name longer than the 50 characters ``makeblastdb -parse_seqids``
+  accepts is now shortened rather than failing the build, keeping the head of
+  the name and appending a digest of the whole of it. The mapping back to the
+  original is written to ``shortened_alleles.tsv`` in the ``igblast_base``, since
+  the shortened name is what IgBLAST reports into a ``v_call``. Only
+  VDJbase-style novel allele names reach the limit; nothing IMGT or OGRDB
+  publishes is close.
++ A build now reports J alleles that the mirrored NCBI auxiliary file does not
+  name, and records them in ``sourcerer_build.yaml``. IgBLAST looks a J germline
+  up in that file by name, so an allele missing from it gets no CDR3 and no
+  productivity call, silently. This is what OGRDB's mouse sets hit: they name
+  their J alleles ``IGKJ0-4JXG*00`` and NCBI's ``mouse_gl.aux`` lists none of
+  them. The recommendation is to build an auxiliary file from the reference and
+  pass it to ``igblastn -auxiliary_data``; sourcerer reports which alleles need
+  rows rather than building the file itself.
 + A download now records its provenance inside ``reference_base``: ``IMGT.yaml``
   with the GENE-DB release, and ``AIRRC.yaml`` with each OGRDB set's version and
   release date, and its Zenodo DOI under ``--resolve-doi``.

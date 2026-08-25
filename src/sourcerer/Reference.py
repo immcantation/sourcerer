@@ -26,6 +26,7 @@ loses it.
 __author__ = 'Ayelet Peres'
 
 # Imports
+import hashlib
 import logging
 import os
 import shutil
@@ -80,6 +81,16 @@ KIND_VDJ = 'vdj'
 KIND_CONSTANT = 'constant'
 KIND_AA = 'vdj_aa'
 
+#: The longest sequence identifier ``makeblastdb -parse_seqids`` accepts. A
+#: longer name is not a warning: makeblastdb refuses the whole database with
+#: "the local id is too long". Dropping -parse_seqids would lift the limit, but
+#: igblastn then reports gnl|BL_ORD_ID|0 instead of the gene name, which MakeDb
+#: cannot parse, so the name has to give instead.
+BLAST_NAME_LIMIT = 50
+
+#: Where a build records the names it had to shorten.
+RENAME_LOG = 'shortened_alleles.tsv'
+
 #: Provenance sidecars written inside reference_base, so they travel with the
 #: reference when airrflow moves the tree. IMGT records the release the FASTAs
 #: came from; AIRRC records each OGRDB set's version. `download --from <ref>`
@@ -109,6 +120,10 @@ class ReferenceReport:
     Arguments:
       written (list): reference_base FASTAs written, as (chain, path) or basename.
       built (list): canonical BLAST database basenames created.
+      renamed (dict): original allele name to the shortened one, for names too
+        long for makeblastdb.
+      aux_missing (dict): species to the J alleles the mirrored NCBI auxiliary
+        file does not name.
       skipped_empty (list): canonical databases skipped because no chain in them
         had any sequence. This is the normal outcome for what a source does not
         cover, such as TR from OGRDB.
@@ -116,6 +131,8 @@ class ReferenceReport:
     written: list = field(default_factory=list)
     built: list = field(default_factory=list)
     skipped_empty: list = field(default_factory=list)
+    renamed: dict = field(default_factory=dict)
+    aux_missing: dict = field(default_factory=dict)
 
     def logSummary(self):
         """Log a one-line summary of what the build produced."""
@@ -139,6 +156,8 @@ class ReferencePlan:
       unrecognized (list): FASTA paths whose names are not in the reference format.
       empty_files (list): recognised FASTA paths that held no sequence.
       duplicates (dict): basename to the number of duplicate names dropped.
+      renamed (dict): original allele name to the shortened one, for every name
+        too long for makeblastdb.
     """
     found_species: list = field(default_factory=list)
     databases: list = field(default_factory=list)
@@ -146,6 +165,7 @@ class ReferencePlan:
     unrecognized: list = field(default_factory=list)
     empty_files: list = field(default_factory=list)
     duplicates: dict = field(default_factory=dict)
+    renamed: dict = field(default_factory=dict)
 
     @property
     def ok(self):
@@ -167,6 +187,9 @@ class ReferencePlan:
                 note = '  (%d duplicate name(s) dropped)' % dropped if dropped else ''
                 lines.append('  %-16s %5d seq  %s%s'
                              % (basename, len(records), dbtype, note))
+        if self.renamed:
+            lines.append('%d allele name(s) shortened to the %d-character BLAST '
+                         'limit' % (len(self.renamed), BLAST_NAME_LIMIT))
         if self.empty:
             lines.append('empty, nothing to build: %s' % ', '.join(self.empty))
         for path in self.empty_files:
@@ -256,6 +279,59 @@ def writeFastaText(path, records):
             written += 1
 
     return written
+
+
+def shortenName(name):
+    """
+    Fit an allele name inside the BLAST identifier limit.
+
+    The head of the name is kept and a short digest of the whole name replaces
+    the tail, so the gene stays readable and two names that share a head still
+    differ. The digest is taken over the original name rather than the discarded
+    tail, so the same allele always shortens to the same thing whichever database
+    it is built into -- which matters because IgBLAST's auxiliary and delineation
+    files are keyed by name.
+
+    Only VDJbase-style novel allele names reach the limit in practice
+    (``IGHV3-20*01_a123g_t456c_...``); nothing IMGT or OGRDB publishes is close.
+
+    Six hex characters of digest keeps the odds of two different names
+    colliding negligible while leaving the readable head almost intact.
+
+    Arguments:
+      name (str): the allele name.
+
+    Returns:
+      str: the name, shortened only if it had to be.
+    """
+    if len(name) <= BLAST_NAME_LIMIT:
+        return name
+
+    digest = hashlib.sha1(name.encode('utf-8')).hexdigest()[:6]
+
+    return '%s_%s' % (name[:BLAST_NAME_LIMIT - 7], digest)
+
+
+def shortenForBlast(records):
+    """
+    Shorten any allele name makeblastdb would refuse, and say which.
+
+    Arguments:
+      records (list): (name, sequence) tuples from cleanForBlast.
+
+    Returns:
+      tuple: (records, renamed) where renamed maps original name to the
+      shortened one, empty when nothing had to change.
+    """
+    renamed = {}
+    shortened = []
+    for name, sequence in records:
+        short = shortenName(name)
+        if short != name:
+            renamed[name] = short
+        shortened.append((short, sequence))
+
+    return shortened, renamed
 
 
 def cleanForBlast(records):
@@ -555,8 +631,9 @@ def writeBuildMetadata(out_dir, report, source_dir, date, generated_by):
     Record what `reference build` produced, and carry the source's provenance.
 
     A custom reference is built into an igblast_base with no upstream release to
-    name, so this records the build itself: what was built, from where, and what
-    came up empty. When the source reference already carries an IMGT.yaml or
+    name, so this records the build itself: what was built, from where, what came
+    up empty, which allele names had to be shortened, and which J alleles the
+    mirrored auxiliary file does not cover. When the source reference already carries an IMGT.yaml or
     AIRRC.yaml, from an earlier download, those are copied in beside it so the
     version provenance travels with the built databases.
 
@@ -576,6 +653,13 @@ def writeBuildMetadata(out_dir, report, source_dir, date, generated_by):
               'built_from': _relativeTo(source_dir, out_dir),
               'databases': list(report.built),
               'skipped_empty': list(report.skipped_empty)}
+    # Both of these change how the databases behave, so they travel with them
+    # rather than living only in the log of the run that built them.
+    if report.renamed:
+        record['shortened_alleles'] = len(report.renamed)
+    if report.aux_missing:
+        record['aux_not_covered'] = {species: list(names) for species, names
+                                     in sorted(report.aux_missing.items())}
     written = [_writeMetadata(out_dir / BUILD_METADATA, record)]
 
     for name in (IMGT_METADATA, AIRRC_METADATA):
@@ -998,6 +1082,9 @@ def _addToPlan(plan, basename, dbtype, records, keep_empty=True):
     dropped = len(records) - len(cleaned)
     if dropped:
         plan.duplicates[basename] = dropped
+
+    cleaned, renamed = shortenForBlast(cleaned)
+    plan.renamed.update(renamed)
     plan.databases.append((basename, dbtype, cleaned))
 
 
@@ -1027,6 +1114,74 @@ def buildIgblastBase(reference_dir, out_dir, client, species=None, mapping=None)
                     len(plan.unrecognized))
 
     return buildFromPlan(plan, out_dir, client)
+
+
+def writeRenameLog(out_dir, renamed):
+    """
+    Record every allele name a build had to shorten.
+
+    A shortened name is what IgBLAST reports and what lands in a v_call, so the
+    mapping back to the original has to be written down or the results cannot be
+    traced to the reference they came from.
+
+    Arguments:
+      out_dir (Path): the igblast_base being built.
+      renamed (dict): original name to shortened name.
+
+    Returns:
+      Path: the file written.
+    """
+    path = Path(out_dir) / RENAME_LOG
+    with open(path, 'w') as handle:
+        handle.write('#original\tshortened\n')
+        for original in sorted(renamed):
+            handle.write('%s\t%s\n' % (original, renamed[original]))
+
+    return path
+
+
+def checkAuxCoverage(out_dir, plan):
+    """
+    Find J alleles the mirrored auxiliary file does not name.
+
+    IgBLAST looks a J germline up in the auxiliary file **by name**, unlike the
+    V delineation file, which it transfers by alignment. A J allele with no row
+    there gets no CDR3 and no productivity call, silently -- igblastn reports
+    ``V-J frame: N/A`` and no CDR3 sub-region rather than failing.
+
+    The auxiliary file mirrored here is NCBI's, so it covers the names IMGT
+    publishes. A reference naming its J alleles otherwise -- OGRDB's mouse sets
+    call them ``IGKJ0-4JXG*00`` -- is not covered, and nothing else would say so.
+
+    The remedy is to build an auxiliary file from the reference itself and pass
+    it to igblastn with ``-auxiliary_data``. Sourcerer does not build one: that
+    belongs with the pipeline that runs IgBLAST. Reporting the gap is what it can
+    usefully do, so the names needing rows are known rather than guessed at.
+
+    Arguments:
+      out_dir (Path): the igblast_base being built.
+      plan (ReferencePlan): the databases that were built.
+
+    Returns:
+      dict: species to the sorted J allele names with no auxiliary row.
+    """
+    missing = {}
+    for basename, _dbtype, records in plan.databases:
+        species, *_rest, segment = basename.split('_')
+        if segment != 'j' or species == 'aa':
+            continue
+
+        path = Path(out_dir) / 'optional_file' / ('%s_gl.aux' % species)
+        if not path.is_file():
+            continue
+        named = {line.split()[0] for line in path.read_text().splitlines()
+                 if line.strip() and not line.startswith('#')}
+
+        absent = {name for name, _sequence in records if name not in named}
+        if absent:
+            missing.setdefault(species, set()).update(absent)
+
+    return {species: sorted(names) for species, names in missing.items()}
 
 
 def buildFromPlan(plan, out_dir, client):
@@ -1061,6 +1216,24 @@ def buildFromPlan(plan, out_dir, client):
         report.built.append(basename)
 
     mirrorSupport(out_dir, client)
+
+    report.renamed = dict(plan.renamed)
+    if plan.renamed:
+        log.warning('%d allele name(s) were longer than the %d-character BLAST '
+                    'limit and were shortened; the mapping is in %s',
+                    len(plan.renamed), BLAST_NAME_LIMIT,
+                    writeRenameLog(out_dir, plan.renamed))
+
+    report.aux_missing = checkAuxCoverage(out_dir, plan)
+    for species, names in sorted(report.aux_missing.items()):
+        log.warning('%s: %d J allele(s) are not named in the mirrored NCBI '
+                    'auxiliary file (%s_gl.aux), so IgBLAST will call no CDR3 '
+                    'and no productivity for reads assigned to them. Build an '
+                    'auxiliary file from this reference and pass it to igblastn '
+                    'with -auxiliary_data. Uncovered: %s',
+                    species, len(names), species, ', '.join(names[:5])
+                    + (', ...' if len(names) > 5 else ''))
+
     report.logSummary()
 
     return report

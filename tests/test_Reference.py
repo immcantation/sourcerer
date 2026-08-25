@@ -388,6 +388,132 @@ class TestReferenceMap(unittest.TestCase):
         self.assertEqual({f[1] for f in files}, {'IGHV', 'IGHJ'})
 
 
+class TestShortenName(unittest.TestCase):
+    """
+    Tests for fitting allele names inside the BLAST identifier limit
+    """
+
+    #: A VDJbase-style novel allele name, the only kind that reaches the limit.
+    LONG = 'IGHV1-18*01_a12g_t45c_g78a_c101t_a134g_t167c_g200a_c233t_a266g'
+
+    def test_a_normal_name_is_untouched(self):
+        """Nothing IMGT or OGRDB publishes is anywhere near the limit."""
+        for name in ('IGHV1-2*02', 'IGHV3/OR16-13*01', 'IGKJ0-4JXG*00'):
+            self.assertEqual(Reference.shortenName(name), name)
+
+    def test_a_long_name_is_cut_to_exactly_the_limit(self):
+        """makeblastdb refuses the whole database over 50, so it must fit."""
+        short = Reference.shortenName(self.LONG)
+        self.assertGreater(len(self.LONG), Reference.BLAST_NAME_LIMIT)
+        self.assertEqual(len(short), Reference.BLAST_NAME_LIMIT)
+        self.assertTrue(short.startswith('IGHV1-18*01_'))
+
+    def test_shortening_is_deterministic(self):
+        """The aux and ndm files are keyed by name, so it cannot drift per run."""
+        self.assertEqual(Reference.shortenName(self.LONG),
+                         Reference.shortenName(self.LONG))
+
+    def test_names_sharing_a_head_stay_distinct(self):
+        """Two novel alleles off the same gene differ only in the discarded tail."""
+        other = self.LONG[:-1] + 'c'
+        self.assertNotEqual(Reference.shortenName(self.LONG),
+                            Reference.shortenName(other))
+
+    def test_records_report_what_changed(self):
+        """The mapping back to the original is what makes a v_call traceable."""
+        records, renamed = Reference.shortenForBlast(
+            [('IGHV1-2*02', 'ACGT'), (self.LONG, 'TTTT')])
+        self.assertEqual(renamed, {self.LONG: Reference.shortenName(self.LONG)})
+        self.assertEqual(records[0], ('IGHV1-2*02', 'ACGT'))
+
+    def test_the_plan_carries_and_reports_the_renames(self):
+        """A build that had to shorten names says so before it is run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / 'human_IGHV.fasta').write_text('>%s\nACGT\n' % self.LONG)
+            plan = Reference.planReference(tmp)
+        self.assertEqual(list(plan.renamed), [self.LONG])
+        self.assertIn('shortened', plan.summary())
+
+    def test_the_log_maps_every_shortened_name_back(self):
+        """The log is the only record of what a shortened v_call really was."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Reference.writeRenameLog(
+                Path(tmp), {self.LONG: Reference.shortenName(self.LONG)})
+            rows = [line.split('\t') for line in path.read_text().splitlines()
+                    if not line.startswith('#')]
+        self.assertEqual(rows, [[self.LONG, Reference.shortenName(self.LONG)]])
+
+    def test_no_log_is_written_when_nothing_was_shortened(self):
+        """The usual case writes no file: the caller only logs when it renamed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / 'human_IGHV.fasta').write_text('>IGHV1-2*02\nACGT\n')
+            plan = Reference.planReference(tmp)
+            self.assertEqual(plan.renamed, {})
+            self.assertFalse((tmp / Reference.RENAME_LOG).exists())
+
+    @unittest.skipUnless(HAS_MAKEBLASTDB, 'makeblastdb is not installed')
+    def test_makeblastdb_accepts_the_shortened_name(self):
+        """
+        The point of the exercise: the long name fails, the shortened one builds.
+
+        makeblastdb -parse_seqids rejects an identifier over 50 characters
+        outright, taking the whole database with it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            for label, name in (('long', self.LONG),
+                                ('short', Reference.shortenName(self.LONG))):
+                fasta = tmp / ('%s.fasta' % label)
+                fasta.write_text('>%s\nACGTACGTACGTACGTACGTACGT\n' % name)
+                if label == 'long':
+                    with self.assertRaises(SourcererError):
+                        Reference.runMakeblastdb(fasta, tmp / label, 'nucl')
+                else:
+                    Reference.runMakeblastdb(fasta, tmp / label, 'nucl')
+                    self.assertTrue((tmp / 'short.nin').exists())
+
+
+class TestAuxCoverage(unittest.TestCase):
+    """
+    Tests for spotting J alleles the mirrored NCBI auxiliary file cannot cover
+    """
+
+    def build(self, tmp, j_names):
+        tmp = Path(tmp)
+        (tmp / 'optional_file').mkdir(parents=True, exist_ok=True)
+        (tmp / 'optional_file' / 'mouse_gl.aux').write_text(
+            '#name\tj_codon_frame\tchain_type\tj_cdr3_end\textra_bps\n'
+            'IGHJ1*01\t0\tJH\t17\t1\n')
+        ref = tmp / 'ref'
+        ref.mkdir(exist_ok=True)
+        (ref / 'mouse_IGHJ.fasta').write_text(
+            ''.join('>%s\nACGT\n' % name for name in j_names))
+
+        return Reference.planReference(ref), tmp
+
+    def test_ogrdb_mouse_j_names_are_reported_as_uncovered(self):
+        """OGRDB names its mouse J alleles in a way NCBI's file never lists."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plan, out = self.build(tmp, ['IGHJ0-32C2*00', 'IGHJ0-7IA7*00'])
+            missing = Reference.checkAuxCoverage(out, plan)
+        self.assertEqual(missing, {'mouse': ['IGHJ0-32C2*00', 'IGHJ0-7IA7*00']})
+
+    def test_a_covered_reference_reports_nothing(self):
+        """A J allele NCBI does name needs no warning."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plan, out = self.build(tmp, ['IGHJ1*01'])
+            self.assertEqual(Reference.checkAuxCoverage(out, plan), {})
+
+    def test_no_auxiliary_file_is_not_a_finding(self):
+        """Without a mirrored file there is nothing to check against."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plan, out = self.build(tmp, ['IGHJ0-32C2*00'])
+            (Path(out) / 'optional_file' / 'mouse_gl.aux').unlink()
+            self.assertEqual(Reference.checkAuxCoverage(out, plan), {})
+
+
 class TestDescribeReference(unittest.TestCase):
     """
     Tests for reporting what a reference folder is and where it came from

@@ -28,6 +28,23 @@ Files are matched on their path relative to the reference folder, or failing
 that on their basename. The manifest overrides the naming rule, so it can also
 correct a file the rule misreads, and it applies to ``diff`` and ``show`` too.
 
+An allele name longer than the 50 characters ``makeblastdb -parse_seqids``
+accepts is shortened rather than failing the build: the head of the name is kept
+and a digest of the whole name replaces the tail. Because the shortened name is
+what IgBLAST reports into a ``v_call``, the mapping back is written to
+``shortened_alleles.tsv`` beside the databases. In practice only VDJbase-style
+novel allele names get near the limit.
+
+A build also reports any J allele the mirrored NCBI auxiliary file does not
+name. IgBLAST looks a J germline up in that file by name, so an allele it does
+not list gets no CDR3 and no productivity call without any error. The names are
+recorded under ``aux_not_covered`` in ``sourcerer_build.yaml``.
+
+Where that happens, build an auxiliary file from the reference itself and pass it
+to ``igblastn`` with ``-auxiliary_data``. Sourcerer does not build one -- that
+belongs with the pipeline running IgBLAST -- but it names the alleles that need
+rows, so the file can be built for exactly those.
+
 ``sourcerer reference show`` reports what a folder is and where it came from,
 reading the ``IMGT.yaml``, ``AIRRC.yaml`` and ``sourcerer_build.yaml`` sidecars
 a download or build leaves behind.

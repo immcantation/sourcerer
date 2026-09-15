@@ -10,9 +10,12 @@ API
    modules/Commandline
    modules/Http
    modules/Schema
+   modules/Contracts
+   modules/Drift
    modules/Catalog
    modules/Convert
    modules/Airrflow
+   modules/Ncbi
    modules/Reference
    modules/Genedb
    modules/Provenance

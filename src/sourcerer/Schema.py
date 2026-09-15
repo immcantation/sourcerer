@@ -16,6 +16,7 @@ __author__ = 'Susanna Marquez'
 
 # Imports
 import difflib
+import logging
 from dataclasses import dataclass
 from dataclasses import field as dcField
 from importlib import resources
@@ -25,6 +26,8 @@ import yaml
 
 # Sourcerer imports
 from sourcerer.Exceptions import SchemaError
+
+log = logging.getLogger(__name__)
 
 #: Snapshot format version this code understands. A snapshot declaring a higher
 #: version is refused rather than misread.
@@ -67,15 +70,41 @@ class Field:
         Returns:
           bool: True if the value may be sent.
         """
+        return self.match(value) is not None
+
+    def match(self, value):
+        """
+        Resolve a candidate to the value the source actually accepts.
+
+        An exact match wins. Otherwise, for a real vocabulary, a case-insensitive
+        match is accepted when it is unique: `--species Human` clearly means
+        `human` and `--disease sars-cov-2` clearly means `SARS-COV-2`, so
+        rejecting them with a "did you mean" hint only made the user retype
+        what the hint had already resolved. Two values differing only in case
+        are left ambiguous, and the caller reports them as unknown.
+
+        Arguments:
+          value (str): the candidate value.
+
+        Returns:
+          str: the value as the source spells it, or None if it is not valid.
+        """
         if value == self.wildcard:
-            return True
+            return value
 
         # A presence-only field has no vocabulary of its own; what it accepts is
         # the presence tokens, which is also what the rejection message advises.
         if self.pseudo_values:
-            return value in PSEUDO_VALUES
+            return value if value in PSEUDO_VALUES else None
 
-        return value in self.values
+        if value in self.values:
+            return value
+
+        folded = [x for x in self.values if x.lower() == value.lower()]
+        if len(folded) == 1:
+            return folded[0]
+
+        return None
 
 
 @dataclass(frozen=True)
@@ -211,11 +240,15 @@ class SourceSchema:
                     % (name, self.source, collection_name,
                        ', '.join(collection.field_names)))
 
-            if not target.accepts(value):
+            accepted = target.match(value)
+            if accepted is None:
                 raise SchemaError(self._badValueMessage(collection_name, target,
                                                         value))
+            if accepted != value:
+                log.info("using '%s' for %s, the source's own spelling of '%s'",
+                         accepted, target.name, value)
 
-            resolved[target.name] = value
+            resolved[target.name] = accepted
 
         return resolved
 
@@ -369,6 +402,50 @@ def loadSchema(source, path=None):
         raise SchemaError('schema.yaml for %s is not a mapping' % source)
 
     return fromDict(payload)
+
+
+def fingerprint(source, path=None):
+    """
+    Hash a source's stored snapshot into one string identifying its content.
+
+    `harvested`/`harvested_by` (recorded separately, on the download
+    provenance record) narrow down which snapshot a download was resolved
+    against but do not pin it: two harvests on the same day, or a
+    hand-edited snapshot, share both and can still differ in content. This
+    hashes schema.yaml's own bytes, and folds in the catalog fingerprint's
+    own sha256 when the source has one (only OAS does today, via
+    catalog_fingerprint.json), since the search fields alone would miss a
+    catalog-only change.
+
+    Arguments:
+      source (str): the source name.
+      path (Path): a directory to read instead of the packaged snapshot.
+
+    Returns:
+      str: a sha256 hex digest, or None if no schema.yaml is stored.
+    """
+    import hashlib
+
+    from sourcerer.Contracts import loadFingerprint
+
+    if path is not None:
+        handle = Path(path) / 'schema.yaml'
+        if not handle.exists():
+            return None
+        text = handle.read_text()
+    else:
+        anchor = resources.files('sourcerer').joinpath('data/schemas', source,
+                                                       'schema.yaml')
+        if not anchor.is_file():
+            return None
+        text = anchor.read_text()
+
+    digest = hashlib.sha256(text.encode('utf-8'))
+    catalog_sha256 = (loadFingerprint(source, path=path) or {}).get('sha256')
+    if catalog_sha256:
+        digest.update(catalog_sha256.encode('utf-8'))
+
+    return digest.hexdigest()
 
 
 #: Fields that record when a harvest ran rather than what it found. They are

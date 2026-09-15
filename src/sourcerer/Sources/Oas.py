@@ -24,6 +24,7 @@ import gzip
 import hashlib
 import json
 import logging
+import os
 import re
 from datetime import UTC
 from pathlib import Path
@@ -34,8 +35,10 @@ from bs4 import BeautifulSoup
 
 # Sourcerer imports
 from sourcerer.Catalog import DETAIL_OK, filterCatalog, loadCatalog, needsDetail
+from sourcerer.Commandline import CommonHelpFormatter
 from sourcerer.Convert import coerceAirrTypes
-from sourcerer.Exceptions import OasParseError
+from sourcerer.Exceptions import OasParseError, SourcererError
+from sourcerer.Http import HttpClient
 from sourcerer.Sources.Base import DataUnit, SourceBase
 
 log = logging.getLogger(__name__)
@@ -78,6 +81,25 @@ FIELD_ALIASES = {
     '#Unique Sequences': 'Unique sequences',
 }
 
+#: Every searchable field the snapshot may carry, mapped to what sourcerer does
+#: with it: the AIRR or samplesheet column it feeds, or an explicit note that it
+#: is a search filter only. A contract test asserts every field in the packaged
+#: snapshot appears here, so when OAS adds a field the monthly refresh PR fails
+#: CI with its name instead of silently ignoring it.
+KNOWN_FIELDS = {
+    'Species': 'samplesheet species',
+    'Age': 'samplesheet age',
+    'BSource': 'samplesheet tissue',
+    'BType': 'samplesheet cell_subset',
+    'Vaccine': 'samplesheet intervention',
+    'Disease': 'samplesheet disease_diagnosis',
+    'Subject': 'samplesheet subject_id',
+    'Longitudinal': 'samplesheet longitudinal',
+    'Chain': 'search filter only; locus is derived from v_call per row',
+    'Isotype': 'c_call, from unit metadata when no per chain Isotype column',
+    'Primer': 'search filter only; no output column',
+}
+
 #: Values OAS uses to mean "not recorded".
 NULL_TOKENS = frozenset(['', 'no', 'No', 'none', 'None', 'NA', 'n/a',
                          'unknown', 'undefined'])
@@ -101,6 +123,23 @@ def isNull(value):
         return True
 
     return str(value).strip() in NULL_TOKENS
+
+
+def clean(value, default=''):
+    """
+    Normalize an OAS metadata value, mapping its null sentinels to a default.
+
+    Arguments:
+      value: the raw value.
+      default (str): what to use when the value carries no information.
+
+    Returns:
+      str: the cleaned value.
+    """
+    if isNull(value):
+        return default
+
+    return str(value).strip()
 
 
 def unescapeOption(text):
@@ -387,7 +426,13 @@ def parseDetailPage(html):
             continue
 
         label = cells[0].get_text().strip().rstrip(':')
-        value = cells[1].get_text().strip()
+        # Detail pages escape a comma inside a value (e.g. BType's
+        # 'Plasmablasts\, Memory B cells and activated T cells') the same way
+        # the search form does, so it must be undone the same way: unescaped,
+        # a value like that can never match --btype's validated (unescaped)
+        # filter, and the exact-match lookup in Catalog.filterCatalog silently
+        # returns zero hits -- the failure mode the snapshot exists to prevent.
+        value = unescapeOption(cells[1].get_text())
         if label and value:
             found[FIELD_ALIASES.get(label, label)] = value
 
@@ -401,6 +446,334 @@ def parseDetailPage(html):
             'layout has changed')
 
     return found
+
+
+# ---------------------------------------------------------------------------
+# Data contracts and catalog fingerprints
+# ---------------------------------------------------------------------------
+
+#: AIRR stems every data unit layout must carry for conversion to work. Declared
+#: rather than derived so a layout that loses one shows up as a contract change.
+REQUIRED_AIRR_STEMS = ('sequence', 'locus', 'v_call', 'j_call', 'junction',
+                       'sequence_alignment', 'germline_alignment')
+
+#: Columns whose presence or absence is what distinguishes the known layouts:
+#: the 158 paired csv/ units genuinely lack Redundancy, c_region and Isotype,
+#: and unpaired units carry no sequence_id at all. Recorded per probe unit as
+#: required_columns and absent_columns so a layout gaining or losing one is a
+#: visible contract change rather than a silent conversion difference.
+CONTRACT_MARKERS = ('Redundancy', 'c_region', 'Isotype', 'sequence_id',
+                    'duplicate_count')
+
+#: How many complete CSV records a contract probe must decode before it stops
+#: extending its byte range.
+PROBE_RECORDS = 2
+
+#: Cap on distinct values per key recorded in the catalog fingerprint. A key
+#: like Run is unique per unit, and enumerating fifteen thousand values would
+#: bloat the fingerprint without describing anything the drift check compares.
+MAX_FINGERPRINT_VALUES = 500
+
+
+def filenamePattern(unit_id):
+    """
+    Normalize a unit's filename to its layout pattern.
+
+    Digit runs are collapsed so that every run accession maps to the same
+    pattern. The result is descriptive bookkeeping for the snapshot, never
+    parsed back: paths stay opaque, and a novel pattern is additive drift.
+
+    Arguments:
+      unit_id (str): the opaque unit identifier.
+
+    Returns:
+      str: the pattern, e.g. 'SRR<n>_paired' or '<n>_S<n>__<n>_Paired_All'.
+    """
+    name = unit_id.rsplit('/', 1)[-1]
+    name = re.sub(r'\.csv\.gz$', '', name)
+
+    return re.sub(r'\d+', '<n>', name)
+
+
+def pathLayouts(rows):
+    """
+    Summarize the directory and filename layouts a catalog contains.
+
+    Arguments:
+      rows (list): catalog rows.
+
+    Returns:
+      dict: observed directory segments and filename patterns, each with unit
+      counts.
+    """
+    segments = {}
+    patterns = {}
+    for row in rows:
+        segment = row.get('dir_segment', '')
+        segments[segment] = segments.get(segment, 0) + 1
+        pattern = filenamePattern(row['unit_id'])
+        patterns[pattern] = patterns.get(pattern, 0) + 1
+
+    return {'observed_dir_segments': dict(sorted(segments.items())),
+            'observed_filename_patterns': dict(sorted(patterns.items()))}
+
+
+def probeComplete(raw):
+    """
+    Decide whether a ranged probe has fetched enough of a data unit.
+
+    Enough means the metadata member has decoded completely (a second member has
+    started) and the CSV member contains the header plus PROBE_RECORDS complete
+    lines. A fixed byte window would stop sufficing the moment the metadata or
+    header grew, so completeness is judged on structure rather than on size.
+
+    Arguments:
+      raw (bytes): the accumulated prefix of the remote file.
+
+    Returns:
+      bool: True once the prefix contains what parseProbeFacts needs.
+    """
+    from sourcerer.Gzip import splitMembers
+
+    members = splitMembers(raw)
+    if len(members) < 2:
+        return False
+
+    text = members[1].decode('utf-8', errors='replace')
+
+    return text.count('\n') >= 1 + PROBE_RECORDS
+
+
+def jsonTypeName(value):
+    """
+    Name a JSON value's type for the contract record.
+
+    Arguments:
+      value: a value decoded from JSON.
+
+    Returns:
+      str: one of 'null', 'bool', 'int', 'float', 'str', 'list', 'dict'.
+    """
+    if value is None:
+        return 'null'
+    # bool subclasses int, so it has to be tested first.
+    for kind, name in ((bool, 'bool'), (int, 'int'), (float, 'float'),
+                       (str, 'str'), (list, 'list'), (dict, 'dict')):
+        if isinstance(value, kind):
+            return name
+
+    return type(value).__name__
+
+
+def parseProbeFacts(raw, unit_id, collection):
+    """
+    Extract the file format facts from a probed data unit prefix.
+
+    Arguments:
+      raw (bytes): the leading bytes of the remote file.
+      unit_id (str): which unit was probed.
+      collection (str): 'paired' or 'unpaired'.
+
+    Returns:
+      dict: the contract facts for this unit's layout.
+
+    Raises:
+      OasParseError: if the prefix does not have the expected structure.
+    """
+    import io
+
+    from sourcerer.Gzip import splitMembers
+
+    members = splitMembers(raw)
+    if len(members) < 2:
+        raise OasParseError(
+            'probe of %s decoded %d gzip member(s) where 2 were expected '
+            '(metadata, then CSV); the data unit framing has changed'
+            % (unit_id, len(members)))
+
+    meta_text = members[0].decode('utf-8', errors='replace')
+    record = next(csv.reader(io.StringIO(meta_text)))
+    if len(record) != 1:
+        raise OasParseError(
+            'probe of %s: the metadata member holds %d CSV fields where 1 was '
+            'expected' % (unit_id, len(record)))
+
+    try:
+        metadata = json.loads(record[0])
+    except ValueError as error:
+        raise OasParseError(
+            'probe of %s: the metadata member is not JSON (%s)'
+            % (unit_id, error))
+
+    columns = next(csv.reader(io.StringIO(
+        members[1].decode('utf-8', errors='replace'))))
+
+    facts = {
+        'unit_id': unit_id,
+        'gzip_members': len(members),
+        'metadata_keys': sorted(metadata),
+        'metadata_value_types': {k: jsonTypeName(v) for k, v in metadata.items()},
+        'n_columns': len(columns),
+        'columns': sorted(columns),
+        'required_airr_stems': list(REQUIRED_AIRR_STEMS),
+    }
+
+    if collection == 'paired':
+        stems = {chain: set() for chain in CHAINS}
+        unsuffixed = []
+        for column in columns:
+            match = CHAIN_COLUMN.match(column)
+            if match is not None:
+                stems[match['chain']].add(match['stem'])
+            else:
+                unsuffixed.append(column)
+        shared = stems['heavy'] & stems['light']
+        facts['suffix_pairing'] = {
+            'suffixes': ['_%s' % x for x in CHAINS],
+            'unsuffixed_columns': sorted(unsuffixed),
+            'paired_stems': len(shared),
+            'unmatched_stems': sorted(stems['heavy'] ^ stems['light'])}
+        present = shared
+    else:
+        present = set(columns)
+
+    facts['required_columns'] = sorted(x for x in CONTRACT_MARKERS
+                                       if x in present)
+    facts['absent_columns'] = sorted(x for x in CONTRACT_MARKERS
+                                     if x not in present)
+
+    return facts
+
+
+def chooseProbeUnits(rows, pinned):
+    """
+    Select one probe unit per path layout, honoring existing pins.
+
+    A pinned unit still present in the catalog is kept: re-choosing every run
+    would churn the snapshot diff and untie the recorded contract from the file
+    it was measured on. A fresh unit is chosen only for a layout with no live
+    pin, preferring the smallest by sequence count so the probe stays cheap; the
+    replacement then appears in the snapshot diff, where a reviewer sees it.
+
+    Arguments:
+      rows (list): catalog rows.
+      pinned (iterable): unit_ids pinned by the existing contracts.
+
+    Returns:
+      dict: dir_segment to the chosen catalog row, in sorted segment order.
+    """
+    def size(row):
+        counts = str(row.get('n_unique_sequences') or '')
+        return (0, int(counts)) if counts.isdigit() else (1, 0)
+
+    chosen = {}
+    pins = set(pinned)
+    for row in rows:
+        segment = row.get('dir_segment', '')
+        if row['unit_id'] in pins and segment not in chosen:
+            chosen[segment] = row
+
+    groups = {}
+    for row in rows:
+        groups.setdefault(row.get('dir_segment', ''), []).append(row)
+    for segment, group in groups.items():
+        if segment not in chosen:
+            chosen[segment] = min(group, key=lambda x: (size(x), x['unit_id']))
+
+    return dict(sorted(chosen.items()))
+
+
+def buildFingerprint(content, headers, payload):
+    """
+    Condense the raw unpaired catalog into the facts the drift check compares.
+
+    The unpaired catalog is a single ~7 MB JSON document, one entry per data
+    unit. Diffing it whole every month would be slow to fetch and unreadable
+    to review, so this reduces it once, at harvest time, to the handful of
+    aggregate facts Drift.py actually looks at, written to
+    catalog_fingerprint.json and compared against the version committed at
+    the last drift check.
+
+    Returned fields, and what each is for:
+
+    - ``collection``: the collection the fingerprinted rows belong to
+      ('unpaired' today, since that is the only machine readable index OAS
+      publishes), or None if the payload named more than one -- see the
+      comment on that key below. Drift.py labels its findings from this
+      rather than assuming a name.
+    - ``sha256`` / ``etag`` / ``last_modified``: cheap validators for "did the
+      document change at all", checked before the more expensive comparisons
+      below run.
+    - ``n_units``: the catalog's total row count; growth or shrinkage between
+      two fingerprints is reported directly from this.
+    - ``key_counts``: how many units carry each metadata key. A key whose
+      count is neither 0 nor n_units is present on a strict subset of units --
+      by definition partial -- which is the anomaly the drift check reports
+      (the real world case: a stray 'Organism' key on exactly 1 of 15,631
+      unpaired units).
+    - ``value_types``: the distinct JSON types seen for each key's values
+      (see jsonTypeName), so a key silently changing shape (e.g. a count
+      written as a string instead of a number) is caught even though the key
+      itself did not change.
+    - ``value_counts``: how many units carry each distinct value of each key,
+      capped per key at MAX_FINGERPRINT_VALUES entries -- past that (an
+      accession-like key with one value per unit, say) the key's entry is
+      None instead, since enumerating unique-per-unit values would make the
+      fingerprint scale with the catalog rather than stay a summary.
+    - ``study_index``: unit count per study, both a human readable summary and
+      what a drift finding's "N new units in <study>" grouping is built from.
+    - ``sample_unit``: one verbatim catalog entry (the first key in sorted
+      order), kept as a live example of the document's actual shape and as a
+      lightweight parser fixture.
+
+    Arguments:
+      content (bytes): the catalog document as served.
+      headers: the response headers.
+      payload (dict): the parsed catalog.
+
+    Returns:
+      dict: the fingerprint, with the fields described above.
+    """
+    key_counts = {}
+    value_types = {}
+    value_counts = {}
+    studies = {}
+    collections = set()
+    for key, meta in payload.items():
+        collection, unit_id = unitIdFromUrl(urlFromCatalogKey(key))
+        collections.add(collection)
+        study = unit_id.split('/')[0]
+        studies[study] = studies.get(study, 0) + 1
+        for name, value in meta.items():
+            key_counts[name] = key_counts.get(name, 0) + 1
+            value_types.setdefault(name, set()).add(jsonTypeName(value))
+            counts = value_counts.setdefault(name, {})
+            if counts is not None:
+                counts[str(value)] = counts.get(str(value), 0) + 1
+                if len(counts) > MAX_FINGERPRINT_VALUES:
+                    value_counts[name] = None
+
+    return {
+        # The Drift findings this fingerprint feeds label themselves from this
+        # field rather than assuming a fixed collection name. Today this is
+        # always 'unpaired' -- the unpaired catalog is the only one OAS
+        # publishes as a machine readable index -- but a mixed document, were
+        # one ever fed in, is a fact worth recording rather than guessing a
+        # label from, so it is left unset (None) rather than picking one side.
+        'collection': next(iter(collections)) if len(collections) == 1 else None,
+        'sha256': hashlib.sha256(content).hexdigest(),
+        'n_units': len(payload),
+        'etag': headers.get('ETag', ''),
+        'last_modified': headers.get('Last-Modified', ''),
+        'key_counts': dict(sorted(key_counts.items())),
+        'value_types': {k: sorted(v) for k, v in sorted(value_types.items())},
+        # None marks a key with more distinct values than the fingerprint
+        # enumerates, such as per unit accessions.
+        'value_counts': {k: (dict(sorted(v.items())) if v is not None else None)
+                         for k, v in sorted(value_counts.items())},
+        'study_index': dict(sorted(studies.items())),
+        'sample_unit': {'key': min(payload), 'metadata': payload[min(payload)]},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -910,6 +1283,390 @@ def _finishChunk(frame, metadata, unit_id, collection, report):
 
 
 # ---------------------------------------------------------------------------
+# The airrflow samplesheet row
+# ---------------------------------------------------------------------------
+
+def countUnresolvedSubjects(entries):
+    """
+    Count data units whose Subject metadata is one of OAS's own null sentinels.
+
+    A unit like this writes that raw sentinel ('no', 'None', ...) into the
+    samplesheet's subject_id column rather than a real identifier -- see
+    samplesheetRow's own comment on why the value is kept raw rather than
+    collapsed to a placeholder. `sourcerer oas verify` is what turns those
+    into real evidence from NCBI; this count is what a caller uses to decide
+    whether it is worth telling the user to run it.
+
+    Arguments:
+      entries (list): (DataUnit, Path) pairs, the same shape
+        Airrflow.buildSamplesheet takes; only the unit's metadata is read
+        here.
+
+    Returns:
+      int: how many units carry no recorded subject.
+    """
+    return sum(1 for unit, _ in entries
+              if isNull((unit.metadata or {}).get('Subject')))
+
+
+def samplesheetRow(unit):
+    """
+    Map an OAS data unit's metadata to airrflow samplesheet columns.
+
+    Arguments:
+      unit (DataUnit): the converted unit.
+
+    Returns:
+      dict: the samplesheet columns OAS metadata can fill in.
+    """
+    metadata = unit.metadata or {}
+
+    # Subject is passed through raw rather than via clean(): a value like OAS's
+    # own "no" carries real information (subject identity was not recorded) and
+    # must not be collapsed and then replaced by the study name, which would
+    # falsely tell airrflow that every otherwise-unidentified unit in the study
+    # is the same subject. The study is used only when OAS supplies no value
+    # for Subject at all.
+    raw_subject = metadata.get('Subject')
+    subject = (str(raw_subject).strip() if raw_subject not in (None, '') else '')
+    subject = subject or clean(metadata.get('study'))
+
+    return {
+        'subject_id': subject.replace(' ', '_'),
+        'species': clean(metadata.get('Species'), 'human').lower(),
+        'tissue': clean(metadata.get('BSource'), 'unknown'),
+        # Not derivable from OAS, but airrflow requires the column to be
+        # populated and asks for NA when it is unknown. NA is a placeholder
+        # here too, so a hand-edited value still survives a later merge.
+        'sex': 'NA',
+        'age': clean(metadata.get('Age'), 'NA'),
+        'biomaterial_provider': clean(metadata.get('Author'),
+                                      clean(metadata.get('study'))),
+        # Driven by the collection rather than hardcoded: only paired data is
+        # single cell, and the R implementation assumed TRUE because it only
+        # ever handled paired.
+        'single_cell': 'TRUE' if unit.collection == 'paired' else 'FALSE',
+        'disease_diagnosis': clean(metadata.get('Disease')),
+        'intervention': clean(metadata.get('Vaccine')),
+        # Like Age, OAS records this as a presence flag ("no" when the
+        # study carries no longitudinal design), so the same null-token
+        # collapse to 'NA' applies, unlike Subject's raw pass-through.
+        'longitudinal': clean(metadata.get('Longitudinal'), 'NA'),
+        'cell_subset': clean(metadata.get('BType')),
+        'study': clean(metadata.get('study')) or unit.study,
+    }
+
+
+# ---------------------------------------------------------------------------
+# oas verify: cross-referencing unresolved subjects against NCBI
+# ---------------------------------------------------------------------------
+
+#: The columns `sourcerer oas verify` adds, appended after whatever columns
+#: the input samplesheet already had (never inserted among them) -- so the
+#: report is the input samplesheet plus evidence, and can be used in its
+#: place as airrflow input, rather than a separate file missing the columns
+#: airrflow actually reads (`filename`, `species`, `pcr_target_locus`, ...).
+NCBI_EVIDENCE_COLUMNS = ('ncbi_sample_name', 'ncbi_subject_suggested', 'status',
+                         'subject_check', 'accession', 'biosample_accession',
+                         'biosample_url', 'pooled_codes')
+
+
+def _addVerifyAction(actions):
+    """
+    Add oas verify: cross-reference a samplesheet's unresolved subjects
+    against NCBI.
+
+    Not a search/download action: it takes no COLLECTION or filter flags,
+    since it reads a samplesheet already on disk rather than querying OAS.
+    Every row with subject_id 'no' or 'None' (OAS's own null sentinels; see
+    isNull above) names an SRA run or GEO sample accession in its
+    sample_name column, and that accession's NCBI BioSample record usually
+    names the sample plainly enough for a human to read off the subject.
+
+    Deliberately two flags, not the larger surface an earlier version of this
+    command had (--apply, --use-suggestion, --evidence-out, --limit): the
+    report is the one thing this command produces, always with both NCBI's raw
+    sample name and a suggested subject, so there was nothing left for a flag
+    to switch between. It carries every column the input samplesheet had, evidence
+    columns appended, so it is a drop-in airrflow input rather than a
+    side file -- see buildEvidenceRow and NCBI_EVIDENCE_COLUMNS.
+
+    Arguments:
+      actions: the oas subcommand's action subparsers (search and download
+        are already on it).
+    """
+    verify = actions.add_parser(
+        'verify', help='cross-reference unresolved subjects against NCBI',
+        description='Write an evidence report with one row per samplesheet '
+                    'row, every input column carried through unchanged. '
+                    'Every row whose sample_name yields a run/sample '
+                    'accession (SRR/ERR/DRR/GSM) is looked up against NCBI, '
+                    'whether or not OAS itself recorded a subject_id -- an '
+                    'OAS-recorded subject can still be wrong (a typo, a '
+                    'short code reused across studies, or a pooled/hashed '
+                    'run naming several donors under one value), and '
+                    'NCBI\'s own record is independent evidence either way. '
+                    'ncbi_sample_name carries NCBI\'s raw sample name -- never '
+                    'guessed at further, since some studies\' names need '
+                    'study-specific reading to turn into a subject id (see '
+                    'the module docstring in Ncbi.py); ncbi_subject_suggested '
+                    'carries the same value with the handful of generic '
+                    'patterns (a trailing locus or visit suffix) stripped, '
+                    'the ones safe to normalize regardless of study. '
+                    'subject_check reports how that compares to the '
+                    'samplesheet\'s own subject_id: \'unresolved\' when OAS '
+                    'recorded none, \'pooled\' when either side names more '
+                    'than one donor, \'agrees\' or \'differs\' otherwise, or '
+                    '\'unverified\' when NCBI itself could not resolve the '
+                    'accession. A pooled/multi-donor run gets an '
+                    'AMBIGUOUS_POOLED marker naming the donor codes in both '
+                    'NCBI columns instead of a guessed single '
+                    'subject. Because every input column survives, the '
+                    'report can be pointed at directly as airrflow --input '
+                    'once subject_id is filled in or corrected for any row '
+                    'that needs it.',
+        formatter_class=CommonHelpFormatter)
+    verify.add_argument('samplesheet', type=Path,
+                        help='an airrflow samplesheet to read; only needs '
+                             'sample_id, sample_name and subject_id columns, '
+                             'so a hand-edited sheet is fine too, but every '
+                             'column it has is carried through to the report'
+                             )
+    verify.add_argument('--out', type=Path, default=None,
+                        help='where to write the evidence report; defaults '
+                             'to <samplesheet-name>.ncbi_evidence<ext>, e.g. '
+                             'samplesheet_airrflow_fasta.ncbi_evidence.tsv '
+                             'for samplesheet_airrflow_fasta.tsv')
+    verify.add_argument('--ncbi-api-key', default=None,
+                        help='an NCBI API key, raising the polite request '
+                             'rate from 3/s to 10/s; prefer setting the '
+                             'NCBI_API_KEY environment variable instead, '
+                             'since a key given here ends up in shell history')
+
+
+def readSamplesheetRows(path):
+    """
+    Read a samplesheet leniently, for verify rather than for the download merge.
+
+    Unlike Airrflow.loadSamplesheet, this accepts any TSV that carries the
+    columns verify actually needs, in any order, alongside whatever else a
+    hand-edited sheet has picked up. Every column present is kept, not just
+    the three verify reads, so the row it came from can be written back out
+    whole.
+
+    Arguments:
+      path (Path): the samplesheet to read.
+
+    Returns:
+      tuple: (fields (list of str), rows (list of dict)), in file order.
+
+    Raises:
+      SourcererError: if a required column is missing.
+    """
+    with open(path, newline='') as handle:
+        reader = csv.DictReader(handle, delimiter='\t')
+        fields = reader.fieldnames or []
+        missing = {'sample_id', 'sample_name', 'subject_id'} - set(fields)
+        if missing:
+            raise SourcererError(
+                '%s is missing column(s) %s that oas verify needs'
+                % (path, ', '.join(sorted(missing))))
+        return list(fields), [dict(row) for row in reader]
+
+
+def normalizeForCompare(text):
+    """
+    Reduce text to bare alphanumerics for a formatting-insensitive comparison.
+
+    Arguments:
+      text (str): the text to normalize.
+
+    Returns:
+      str: lowercased, with everything but letters and digits stripped.
+    """
+    return ''.join(c for c in str(text or '').lower() if c.isalnum())
+
+
+def subjectCheck(subject_id, found):
+    """
+    Compare a samplesheet's own subject_id against NCBI's evidence for it.
+
+    Run unconditionally, even when subject_id already looks real: OAS's own
+    value can still be wrong -- a typo, a short code reused across studies
+    (see buildEvidenceRow's caller), or a pooled/hashed run that names
+    several donors under one value (Ncbi.poolCodes is applied to subject_id
+    itself here, not only to NCBI's text, because OAS's own Subject field
+    uses the same semicolon-separated donor lists).
+
+    Arguments:
+      subject_id (str): the samplesheet row's own subject_id.
+      found (Ncbi.Evidence): the NCBI lookup for this row's accession, or
+        None if no accession could be read from sample_name.
+
+    Returns:
+      str: 'unresolved' if OAS recorded no subject at all, 'pooled' if
+        either side names more than one donor, 'unverified' if NCBI could
+        not resolve the accession (so there is nothing to compare against),
+        otherwise 'agrees' or 'differs'.
+    """
+    if isNull(subject_id):
+        return 'unresolved'
+
+    from sourcerer.Ncbi import poolCodes
+    if poolCodes(subject_id) or (found is not None and found.status == 'pooled'):
+        return 'pooled'
+
+    if found is None or found.status != 'ok':
+        return 'unverified'
+
+    ncbi_text = normalizeForCompare(found.sample_name)
+    oas_text = normalizeForCompare(subject_id)
+    if oas_text and ncbi_text and (oas_text in ncbi_text or ncbi_text in oas_text):
+        return 'agrees'
+
+    return 'differs'
+
+
+def buildEvidenceRow(row, found):
+    """
+    Build one row of the verify evidence report.
+
+    Every column already on `row` passes through verbatim -- this only adds
+    NCBI_EVIDENCE_COLUMNS, it never edits or drops what was already on the
+    samplesheet. ncbi_sample_name and ncbi_subject_suggested always come from
+    NCBI, never from the samplesheet's own subject_id: a real-looking
+    subject_id is not proof it is correct, which is exactly what
+    subject_check is for. A pooled/multi-donor run gets an AMBIGUOUS_POOLED
+    marker in both columns, since there is no single subject to suggest.
+    Anything else takes ncbi_sample_name from NCBI's raw sample name and
+    ncbi_subject_suggested from the generic-heuristic strip of it (see
+    Ncbi.suggestSubject) -- both always written, so joining this report back
+    onto a samplesheet never needs a flag to decide which one it gets.
+
+    Arguments:
+      row (dict): the samplesheet row.
+      found (Ncbi.Evidence): the NCBI lookup for this row's accession, or
+        None if no accession could be read from sample_name.
+
+    Returns:
+      dict: row, plus NCBI_EVIDENCE_COLUMNS.
+    """
+    subject_id = row.get('subject_id', '')
+
+    if found is None:
+        evidence = {'ncbi_sample_name': '', 'ncbi_subject_suggested': '',
+                   'status': 'no_accession', 'accession': '', 'biosample_accession': '',
+                   'biosample_url': '', 'pooled_codes': ''}
+    else:
+        pooled_codes = ';'.join(found.pooled_codes)
+        if found.status == 'pooled':
+            ncbi_sample_name = ncbi_subject_suggested = 'AMBIGUOUS_POOLED:%s' % pooled_codes
+        elif found.status == 'ok':
+            ncbi_sample_name = found.sample_name
+            ncbi_subject_suggested = found.suggested_subject
+        else:
+            ncbi_sample_name = ncbi_subject_suggested = ''
+        evidence = {'ncbi_sample_name': ncbi_sample_name,
+                   'ncbi_subject_suggested': ncbi_subject_suggested,
+                   'status': found.status, 'accession': found.accession,
+                   'biosample_accession': found.biosample_accession,
+                   'biosample_url': found.url, 'pooled_codes': pooled_codes}
+
+    evidence['subject_check'] = subjectCheck(subject_id, found)
+
+    return {**row, **evidence}
+
+
+def warnReusedSubjects(rows):
+    """
+    Log a warning when the same subject_id is used by more than one study.
+
+    airrflow keys a subject on subject_id alone, so two different studies
+    reusing the same short code (e.g. 'Donor-2') silently merges two
+    unrelated people into one subject downstream. This is exactly the kind
+    of collision a row-by-row read of subject_check is unlikely to catch,
+    since each individual row looks unremarkable on its own.
+
+    Arguments:
+      rows (list): samplesheet rows; only those carrying both subject_id and
+        study are considered.
+    """
+    studies_by_subject = {}
+    for row in rows:
+        subject = row.get('subject_id', '')
+        study = row.get('study', '')
+        if isNull(subject) or not study:
+            continue
+        studies_by_subject.setdefault(subject, set()).add(study)
+
+    for subject, studies in sorted(studies_by_subject.items()):
+        if len(studies) > 1:
+            log.warning("subject_id '%s' is used by %d different studies: %s",
+                       subject, len(studies), ', '.join(sorted(studies)))
+
+
+def handleOasVerify(args):
+    """Cross-reference every samplesheet row's subject against NCBI."""
+    from sourcerer.Ncbi import (
+        DEFAULT_DELAY,
+        KEYED_DELAY,
+        accessionFromText,
+        gatherEvidence,
+    )
+
+    fields, rows = readSamplesheetRows(args.samplesheet)
+    warnReusedSubjects(rows)
+
+    # Every row with a readable accession is looked up, not only rows OAS
+    # left unresolved: a subject_id OAS did record is still worth checking
+    # against NCBI's own record (see subjectCheck), so there is no 'pending'
+    # subset here to restrict the lookup to.
+    accession_by_sample = {}
+    for row in rows:
+        accession = accessionFromText(row.get('sample_name', ''))
+        if accession is not None:
+            accession_by_sample[row['sample_id']] = accession
+
+    accessions = set(accession_by_sample.values())
+    api_key = args.ncbi_api_key or os.environ.get('NCBI_API_KEY')
+    delay = KEYED_DELAY if api_key else DEFAULT_DELAY
+    client = HttpClient(delay=delay)
+    evidence = (gatherEvidence(client, accessions, api_key=api_key)
+               if accessions else {})
+
+    counts = {}
+    evidence_rows = []
+    for row in rows:
+        accession = accession_by_sample.get(row['sample_id'])
+        found = evidence.get(accession) if accession is not None else None
+        evidence_row = buildEvidenceRow(row, found)
+        counts[evidence_row['status']] = counts.get(evidence_row['status'], 0) + 1
+        evidence_rows.append(evidence_row)
+
+    # Input columns first, in their own order, then whichever evidence columns
+    # were not already among them -- so a samplesheet round-tripped through
+    # verify keeps every field it walked in with.
+    out_fields = fields + [c for c in NCBI_EVIDENCE_COLUMNS if c not in fields]
+    # <name>.ncbi_evidence<ext>, not <name><ext>.ncbi_evidence.tsv: the input's
+    # own extension moves after 'ncbi_evidence' rather than getting a second
+    # one appended after it.
+    out = args.out or args.samplesheet.with_name(
+        args.samplesheet.stem + '.ncbi_evidence' + args.samplesheet.suffix)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, 'w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=out_fields,
+                                delimiter='\t', lineterminator='\n')
+        writer.writeheader()
+        writer.writerows(evidence_rows)
+
+    log.info('%d rows: %s', len(rows),
+             ', '.join('%d %s' % (n, status) for status, n in sorted(counts.items())))
+    log.info('wrote %s', out)
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # The source
 # ---------------------------------------------------------------------------
 
@@ -945,6 +1702,37 @@ class OasSource(SourceBase):
     #: in every unit, so combining units without a prefix silently merges
     #: unrelated cells rather than failing.
     prefix_ids = False
+
+    #: Fingerprint of the raw unpaired catalog, set as a side effect of
+    #: harvesting it, so that a refresh fingerprints the same bytes it indexed.
+    catalog_fingerprint = None
+
+    catalog_columns = ('unit_id', 'collection', 'url', 'dir_segment', 'study',
+                       'run', 'n_unique_sequences', 'Species', 'Isotype',
+                       'Chain', 'Disease', 'Vaccine', 'Subject', 'Age',
+                       'Longitudinal', 'BSource', 'BType', 'Author',
+                       'detail_status', 'detail_attempted')
+    search_columns = ('Species', 'Disease', 'Subject', 'BSource')
+    enrichment_columns = ('BSource', 'BType', 'Author')
+
+    def newReport(self):
+        """See SourceBase.newReport."""
+        return newReport()
+
+    def samplesheetRow(self, unit):
+        """See SourceBase.samplesheetRow."""
+        return samplesheetRow(unit)
+
+    def countUnresolvedSubjects(self, entries):
+        """See SourceBase.countUnresolvedSubjects."""
+        return countUnresolvedSubjects(entries)
+
+    @classmethod
+    def addActions(cls, actions):
+        """Add oas verify. See SourceBase.addActions."""
+        _addVerifyAction(actions)
+
+        return {'verify': handleOasVerify}
 
     def formUrl(self, collection):
         """
@@ -1064,10 +1852,16 @@ class OasSource(SourceBase):
         """
         Build the unpaired catalog from the published JSON index.
 
+        Also fingerprints the raw document while it is in hand, so that the
+        drift check can compare the catalog's shape without re-fetching it.
+
         Returns:
           list: catalog rows.
         """
-        payload = self.client.get(CATALOG_URL).json()
+        response = self.client.get(CATALOG_URL)
+        payload = json.loads(response.content)
+        self.catalog_fingerprint = buildFingerprint(response.content,
+                                                    response.headers, payload)
 
         rows = []
         for key, meta in payload.items():
@@ -1127,13 +1921,95 @@ class OasSource(SourceBase):
                 row['detail_status'] = 'failed'
                 continue
 
-            for name in ('BSource', 'BType', 'Author'):
+            for name in self.enrichment_columns:
                 if found.get(name):
                     row[name] = found[name]
             row['detail_status'] = DETAIL_OK
             enriched += 1
 
         return enriched
+
+    def harvestContracts(self, catalogs, existing=None):
+        """
+        Probe pinned data units and record the downloaded file format.
+
+        One unit per path layout is fetched by progressive byte ranges, decoded
+        far enough to see the metadata member and the CSV header, and reduced to
+        the facts conversion depends on. Collections not harvested this run keep
+        their existing entries, so a partial refresh cannot silently drop a
+        contract.
+
+        Arguments:
+          catalogs (dict): collection name to catalog rows.
+          existing (dict): the stored contracts, for probe unit pins.
+
+        Returns:
+          dict: the data contracts payload.
+
+        Raises:
+          ProbeIncompleteError: if a probe hit its byte cap. This is a harvest
+            failure, not drift; a slow or truncated response must not read as a
+            format change.
+          OasParseError: if a probed prefix does not have the expected shape.
+        """
+        from datetime import datetime
+
+        from sourcerer.Contracts import CONTRACTS_VERSION
+        from sourcerer.Version import __version__
+
+        collections = dict((existing or {}).get('collections') or {})
+        for collection, rows in sorted(catalogs.items()):
+            pinned = [x['unit_id'] for x in
+                      (collections.get(collection) or {}).get('probe_units', [])]
+            probes = []
+            for segment, row in chooseProbeUnits(rows, pinned).items():
+                log.info('probing %s %s unit %s', self.name, collection,
+                         row['unit_id'])
+                raw = self.client.readRanges(row['url'], probeComplete)
+                facts = parseProbeFacts(raw, row['unit_id'], collection)
+                facts['dir_segment'] = segment
+                probes.append(facts)
+            collections[collection] = {'path_layouts': pathLayouts(rows),
+                                       'probe_units': probes}
+
+        return {'schema_version': CONTRACTS_VERSION,
+                'harvested': datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'harvested_by': 'sourcerer %s' % __version__,
+                'collections': collections}
+
+    def harvestArtifacts(self, out, schema, catalogs):
+        """
+        Write the OAS specific snapshot artifacts.
+
+        Arguments:
+          out (Path): the snapshot directory being written.
+          schema (SourceSchema): the freshly harvested schema.
+          catalogs (dict): collection name to the catalog rows harvested this
+            run.
+
+        Returns:
+          dict: artifact name to (path, changed).
+        """
+        from sourcerer.Contracts import (
+            loadContracts,
+            saveContracts,
+            saveFingerprint,
+        )
+
+        # Pins come from the directory being written when it already holds
+        # contracts, otherwise from the packaged snapshot, so a refresh into a
+        # fresh --out directory still keeps the committed pins.
+        existing = loadContracts(self.name, path=out) or loadContracts(self.name)
+
+        written = {}
+        contracts = self.harvestContracts(catalogs, existing=existing)
+        written['data_contracts'] = saveContracts(contracts, out)
+
+        if self.catalog_fingerprint is not None:
+            written['catalog_fingerprint'] = saveFingerprint(
+                self.catalog_fingerprint, out)
+
+        return written
 
     def catalogPath(self, collection):
         """

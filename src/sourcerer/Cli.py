@@ -12,15 +12,16 @@ __author__ = 'Susanna Marquez'
 import logging
 import sys
 from argparse import ArgumentParser
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Sourcerer imports
-from sourcerer import Catalog, Convert, Provenance, Reference
+from sourcerer import Catalog, Contracts, Convert, Provenance, Reference
 from sourcerer.Airrflow import buildSamplesheet
 from sourcerer.Commandline import CommonHelpFormatter, setupLogging
 from sourcerer.Exceptions import SourcererError
 from sourcerer.Http import HttpClient
-from sourcerer.Schema import loadSchema, saveSchema
+from sourcerer.Schema import PSEUDO_VALUES, loadSchema, saveSchema
 from sourcerer.Sources import ALIASES, REGISTRY, canonicalName, getSource
 from sourcerer.Version import __date__, __version__
 
@@ -28,6 +29,13 @@ log = logging.getLogger('sourcerer')
 
 #: Output formats the download and convert subcommands can produce.
 FORMATS = ('raw', 'airr', 'fasta')
+
+#: Extra subcommands a source registered via SourceBase.addActions, keyed by
+#: canonical source name then action name. Populated as a side effect of
+#: getArgParser() building each source's parser, and read back by main()'s
+#: dispatch -- getArgParser() always runs first, so this is never read before
+#: it is populated. OAS's `verify` is the one entry today.
+SOURCE_ACTIONS = {}
 
 #: Pseudo-collection for germline sources: fetch every species sourcerer supports
 #: into one reference_base. Not offered for OAS (its collections are paired and
@@ -79,8 +87,13 @@ def addFilterArgs(parser, schema, source, collection):
         return
 
     for item in schema.getCollection(collection).fields:
+        # A presence-only flag takes a fixed token set, so the usage line spells
+        # it out the way argparse does for choices; the others take a value
+        # from a vocabulary too long for the usage line, listed in the help.
+        metavar = 'VALUE'
         if item.pseudo_values:
             summary = 'filter on whether %s is recorded' % item.name
+            metavar = '{%s,%s}' % (item.wildcard, ','.join(sorted(PSEUDO_VALUES)))
         elif len(item.values) <= VALUE_LIST_CAP:
             summary = '%d values: %s' % (len(item.values), ', '.join(item.values))
         else:
@@ -93,7 +106,7 @@ def addFilterArgs(parser, schema, source, collection):
                        % (len(item.values), shown, source, collection, item.name))
 
         parser.add_argument(item.flag, dest='filter_%s' % item.name,
-                            metavar='VALUE', default=None, help=summary)
+                            metavar=metavar, default=None, help=summary)
 
 
 def collectFilters(args):
@@ -277,6 +290,35 @@ def _addSchemaParser(commands):
     refresh.add_argument('--detail-limit', type=int, default=None,
                          help='stop after this many detail pages')
 
+    check = actions.add_parser(
+        'check', help='classify drift between two snapshots',
+        description='Compare the packaged snapshot against a stored one and '
+                    'classify every difference by severity: additive (new '
+                    'values or units), anomaly (internal inconsistency), '
+                    'removed (something users may pin disappeared) or '
+                    'structural (the shape sourcerer parses changed). The '
+                    'exit status reflects the overall level when it reaches '
+                    'the --fail-on threshold.',
+        formatter_class=CommonHelpFormatter)
+    check.add_argument('--source', required=True,
+                       choices=sorted(REGISTRY) + sorted(ALIASES),
+                       help='which source to check')
+    check.add_argument('--against', default='git:HEAD',
+                       help='what to compare the packaged snapshot to: '
+                            'git:REV reads the snapshot committed at that '
+                            'revision, anything else is a snapshot directory')
+    check.add_argument('--report', type=Path, default=None,
+                       help='write the findings as JSON to this file')
+    check.add_argument('--markdown', type=Path, default=None,
+                       help='write the findings as markdown to this file')
+    check.add_argument('--fail-on', default='structural',
+                       choices=['never', 'additive', 'anomaly', 'removed',
+                                'structural'],
+                       help='exit non-zero when the overall level is at or '
+                            'above this; never always exits 0')
+    check.add_argument('--no-probe', action='store_true',
+                       help='skip the live URL rule probe, for offline use')
+
 
 def _addSourceParser(commands, name, source):
     """Add one source's subcommand tree, with a level per collection."""
@@ -380,12 +422,17 @@ def _addSourceParser(commands, name, source):
                                       choices=FORMATS,
                                       help='what to write, repeatable to write '
                                            'several; raw mirrors the source files '
-                                           'untouched and is always written because '
-                                           'the others are converted from it, so '
-                                           'omitting this writes raw alone')
+                                           'untouched and is always written whether '
+                                           'or not it is requested, since airr and '
+                                           'fasta are converted from it, so omitting '
+                                           'this writes airr alone')
                     leaf.add_argument('--strict-airr', action='store_true',
                                       help='drop columns the AIRR schema does '
                                            'not define')
+
+    # A source's own subcommands beyond search/download, e.g. oas verify. The
+    # handler map returned is read back by main()'s dispatch.
+    SOURCE_ACTIONS[name] = source.addActions(actions)
 
 
 #: Request delay for the IgBLAST support mirror. The default is cautious because
@@ -464,14 +511,22 @@ def handleSchemaRefresh(args):
 
     written, changed = saveSchema(schema, out)
     log.info('%s %s', 'wrote' if changed else 'unchanged, left alone:', written)
+    changed_any = changed
 
     wanted = args.collection or list(source.collections)
+    catalogs = {}
     for collection in wanted:
         log.info('harvesting %s %s catalog', args.source, collection)
         rows = source.harvestCatalog(collection, schema=schema)
+        if rows is None:
+            # This source searches live rather than through an offline
+            # catalog (every germline source today), so there is nothing
+            # here to merge, enrich from detail pages, or write.
+            continue
 
         path = out / ('%s_catalog.tsv' % collection)
-        rows = Catalog.mergeEnrichment(Catalog.loadCatalog(path), rows)
+        rows = Catalog.mergeEnrichment(Catalog.loadCatalog(path), rows,
+                                       source.enrichment_columns)
 
         if args.refresh_details != 'none':
             force = args.refresh_details == 'all'
@@ -481,10 +536,61 @@ def handleSchemaRefresh(args):
                          len(pending), collection)
                 source.enrichCatalog(rows, limit=args.detail_limit, force=force)
 
-        Catalog.saveCatalog(rows, path)
-        log.info('wrote %s (%d units)', path, len(rows))
+        path, changed = Catalog.saveCatalog(rows, path, columns=source.catalog_columns)
+        log.info('%s %s (%d units)',
+                 'wrote' if changed else 'unchanged, left alone:', path, len(rows))
+        changed_any = changed_any or changed
+        catalogs[collection] = rows
+
+    for name, (path, changed) in sorted(
+            source.harvestArtifacts(out, schema, catalogs).items()):
+        log.info('%s %s', 'wrote' if changed else 'unchanged, left alone:', path)
+        changed_any = changed_any or changed
+
+    # The provenance record moves only when the snapshot did: a quiet refresh
+    # leaves every tracked file alone, which is what keeps the scheduled
+    # workflow from opening a pull request on a quiet month.
+    if changed_any:
+        stamp = datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
+        record = Contracts.saveProvenance(out, stamp, __version__)
+        log.info('wrote %s', record)
 
     return 0
+
+
+def handleSchemaCheck(args):
+    """Classify drift between the packaged snapshot and a stored one."""
+    from sourcerer import Drift
+
+    args.source = canonicalName(args.source)
+
+    old = Drift.loadSnapshot(args.source, args.against)
+    new = Drift.loadSnapshotDir(args.source)
+    client = None if args.no_probe else makeClient(args)
+
+    findings = Drift.checkDrift(old, new, client=client)
+    report = Drift.buildReport(args.source, args.against, findings)
+
+    if args.report is not None:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(Contracts.serializeJson(report))
+        log.info('wrote %s', args.report)
+    if args.markdown is not None:
+        args.markdown.parent.mkdir(parents=True, exist_ok=True)
+        args.markdown.write_text(Drift.renderMarkdown(report))
+        log.info('wrote %s', args.markdown)
+
+    level = report['overall_level']
+    if not findings:
+        log.info('no drift against %s', args.against)
+    else:
+        for finding in findings:
+            where = (' [%s]' % finding.collection) if finding.collection else ''
+            log.info('%-10s %s%s: %s', finding.level, finding.category, where,
+                     finding.message)
+        log.info('overall level: %s (%d finding(s))', level, len(findings))
+
+    return Drift.exitCode(findings, args.fail_on)
 
 
 def handleSearch(args):
@@ -504,18 +610,43 @@ def handleSearch(args):
     rows = [{'unit_id': x.unit_id, 'collection': x.collection,
              'n_unique_sequences': x.n_sequences or '', 'url': x.url,
              **{k: v for k, v in x.metadata.items()
-                if k in Catalog.CATALOG_COLUMNS}}
+                if k in source.catalog_columns}}
             for x in units]
 
     if args.out is not None:
-        Catalog.saveCatalog(rows, args.out)
+        Catalog.saveCatalog(rows, args.out, columns=source.catalog_columns)
         log.info('wrote %s', args.out)
-    else:
-        for unit in units:
-            print('%-64s %10s' % (unit.unit_id, unit.n_sequences or ''))
+    elif units:
+        print(formatUnitTable(units, columns=source.search_columns))
 
     return 0
 
+
+def formatUnitTable(units, columns=()):
+    """
+    Render data units as an aligned text table for stdout.
+
+    Arguments:
+      units (list): DataUnit objects.
+      columns (tuple): metadata keys to show after the identifier and count.
+
+    Returns:
+      str: the table, header first, without a trailing newline.
+    """
+    header = ['unit_id', 'n_unique_sequences'] + list(columns)
+    rows = [[x.unit_id, str(x.n_sequences or '')]
+            + [str(x.metadata.get(c, '') or '') for c in columns]
+            for x in units]
+    widths = [max(len(row[i]) for row in [header] + rows)
+              for i in range(len(header))]
+
+    lines = []
+    for row in [header] + rows:
+        cells = [row[0].ljust(widths[0]), row[1].rjust(widths[1])]
+        cells += [cell.ljust(width) for cell, width in zip(row[2:], widths[2:])]
+        lines.append('  '.join(cells).rstrip())
+
+    return '\n'.join(lines)
 
 def loadMap(args):
     """
@@ -719,15 +850,20 @@ def handleDownload(args):
                             limit=args.limit)
 
     units = source.searchUnits(query)
-    formats = args.formats or ['raw']
+    # Defaults to airr, not raw: sourcerer exists to hand Immcantation
+    # something it can use directly, and the raw mirror alone (the previous
+    # default) needs a second `download` run before airrflow can read
+    # anything. Nothing is lost by defaulting this way -- raw is always
+    # written regardless, see the bucket comment below.
+    formats = args.formats or ['airr']
     total = sum(x.n_sequences or 0 for x in units)
 
     log.info('%d data units, %s sequences, formats: %s',
              len(units), format(total, ','), ', '.join(formats))
 
     if args.dry_run:
-        for unit in units:
-            print('%-64s %10s' % (unit.unit_id, unit.n_sequences or ''))
+        if units:
+            print(formatUnitTable(units, columns=source.search_columns))
         log.info('dry run: nothing downloaded')
         return 0
 
@@ -739,6 +875,11 @@ def handleDownload(args):
     written = {x: [] for x in set(formats) | {'raw'}}
     loci = {}
     provenance = []
+    # Accumulated across every unit converted this run and written into
+    # download_metadata.yml, since a conversion that silently drops or
+    # mismaps rows would otherwise leave nothing on disk saying so. Stays
+    # empty (and so unwritten) on a raw-only run, where nothing is converted.
+    conversion_total = {}
 
     for unit in units:
         result = source.fetchUnit(unit, raw_dir, resume=not args.no_resume)
@@ -746,44 +887,75 @@ def handleDownload(args):
         outputs = {}
 
         stem = unit.unit_id.replace('/', '_').replace('.csv.gz', '')
+        # One pass over the unit feeds every requested writer. Converting once
+        # per format read and normalized the whole (multi-GB) file once per
+        # format, so airr+fasta cost twice what airr alone did.
+        writers = {}
         if 'airr' in formats:
-            _, chunks, report = source.convertUnit(result.path, unit)
             dest = outdir / 'airr' / ('%s.tsv' % stem)
-            validation = Convert.writeAirr(chunks, dest, strict=args.strict_airr)
-            Convert.writeValidationReport(validation, dest)
-            log.info('%s: %d rows, %d invalid, %d rows in',
-                     dest.name, validation['rows_checked'],
-                     validation['rows_invalid'], report['rows_in'])
-            loci[unit.unit_id] = report['loci']
-            written['airr'].append((unit, dest))
-            outputs['airr'] = dest
-
+            writers['airr'] = Convert.AirrWriter(dest, strict=args.strict_airr)
         if 'fasta' in formats:
-            _, chunks, report = source.convertUnit(result.path, unit)
             dest = outdir / 'fasta' / ('%s.fasta' % stem)
-            Convert.writeFasta(chunks, dest)
-            loci.setdefault(unit.unit_id, report['loci'])
-            written['fasta'].append((unit, dest))
-            outputs['fasta'] = dest
+            writers['fasta'] = Convert.FastaWriter(dest)
+
+        if writers:
+            _, chunks, report = source.convertUnit(result.path, unit)
+            try:
+                for frame in chunks:
+                    for writer in writers.values():
+                        writer.write(frame)
+            finally:
+                for writer in writers.values():
+                    writer.close()
+
+            loci[unit.unit_id] = report['loci']
+            Provenance.mergeConversionReport(conversion_total, report)
+            for fmt, writer in writers.items():
+                written[fmt].append((unit, writer.out))
+                outputs[fmt] = writer.out
+
+            if 'airr' in writers:
+                validation = writers['airr'].validation
+                Convert.writeValidationReport(validation, writers['airr'].out)
+                log.info('%s: %d rows, %d invalid, %d rows in',
+                         writers['airr'].out.name, validation['rows_checked'],
+                         validation['rows_invalid'], report['rows_in'])
 
         provenance.append(
             Provenance.buildUnitRecord(unit, result, outdir, outputs))
 
     # A samplesheet is a derived artifact of a data format, so one is written per
     # converted format rather than one ambiguous sheet naming a single file.
+    #
+    # Computed once, from the raw bucket rather than per format: every unit is
+    # in it regardless of which formats were requested, and a unit's Subject
+    # metadata does not depend on which format its samplesheet row ends up in.
+    unresolved = source.countUnresolvedSubjects(written['raw'])
     for fmt in ('airr', 'fasta'):
         if written.get(fmt):
             sheet = outdir / ('samplesheet_airrflow_%s.tsv' % fmt)
-            buildSamplesheet(written[fmt], sheet, args.collection, outdir,
-                             loci=loci)
+            buildSamplesheet(written[fmt], sheet, source, outdir, loci=loci)
             log.info('wrote %s', sheet)
+            if unresolved:
+                # The likeliest silent-wrong-analysis outcome this command can
+                # produce: every one of these rows gets the same null-sentinel
+                # subject, so airrflow would treat them all as one subject
+                # unless the user runs verify first. Generic across sources: it
+                # fires only for a source whose countUnresolvedSubjects and
+                # verify both back it up, which today is OAS alone.
+                log.warning(
+                    "%d of %d units have no subject recorded in %s; run "
+                    "'sourcerer %s verify %s' to cross-reference them "
+                    'against NCBI before using this samplesheet',
+                    unresolved, len(units), source.name.upper(), source.name,
+                    sheet)
 
     # Written for every run, including raw-only ones: the raw mirror is the part
     # of the output that cannot be regenerated from anything else here.
     record = Provenance.writeDownloadMetadata(
         outdir, args.source, args.collection, collectFilters(args), args.limit,
         formats, provenance, schema=source.schema, license=source.license,
-        citation=source.citation)
+        citation=source.citation, conversion_report=conversion_total)
     log.info('wrote %s', record)
 
     return 0
@@ -814,6 +986,8 @@ def main():
                 return handleSchemaShow(args)
             if args.action == 'refresh':
                 return handleSchemaRefresh(args)
+            if args.action == 'check':
+                return handleSchemaCheck(args)
             parser.parse_args([args.command, '--help'])
 
         if args.command == 'reference':
@@ -830,6 +1004,11 @@ def main():
                 return handleSearch(args)
             if args.action == 'download':
                 return handleDownload(args)
+            # Anything else is a subcommand the source added itself via
+            # SourceBase.addActions, e.g. oas verify.
+            handler = SOURCE_ACTIONS.get(source_name, {}).get(args.action)
+            if handler is not None:
+                return handler(args)
 
         parser.print_help(sys.stderr)
         return 1

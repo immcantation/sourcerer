@@ -26,7 +26,6 @@ from pathlib import Path
 
 # Sourcerer imports
 from sourcerer.Exceptions import SourcererError
-from sourcerer.Sources.Oas import isNull
 
 log = logging.getLogger(__name__)
 
@@ -35,8 +34,8 @@ log = logging.getLogger(__name__)
 SAMPLESHEET_COLUMNS = ('sample_id', 'filename', 'subject_id', 'species',
                        'pcr_target_locus', 'tissue', 'sex', 'age',
                        'biomaterial_provider', 'single_cell', 'intervention',
-                       'disease_diagnosis', 'cell_subset', 'study',
-                       'sample_name')
+                       'disease_diagnosis', 'longitudinal', 'cell_subset',
+                       'study', 'sample_name')
 
 #: Loci that map to each airrflow pcr_target_locus value.
 IG_LOCI = frozenset(['IGH', 'IGK', 'IGL'])
@@ -91,23 +90,6 @@ def targetLocus(loci):
         return 'TR'
 
     return ''
-
-
-def clean(value, default=''):
-    """
-    Normalize a metadata value, mapping the source's null sentinels to a default.
-
-    Arguments:
-      value: the raw value.
-      default (str): what to use when the value carries no information.
-
-    Returns:
-      str: the cleaned value.
-    """
-    if isNull(value):
-        return default
-
-    return str(value).strip()
 
 
 def loadSamplesheet(path):
@@ -207,7 +189,7 @@ def mergeSamplesheet(existing, fresh):
     return merged
 
 
-def buildSamplesheet(entries, out, collection, root=None, loci=None):
+def buildSamplesheet(entries, out, source, root=None, loci=None):
     """
     Write an airrflow samplesheet describing converted data units.
 
@@ -219,7 +201,10 @@ def buildSamplesheet(entries, out, collection, root=None, loci=None):
     Arguments:
       entries (list): (DataUnit, Path) pairs naming the converted output.
       out (Path): where to write the samplesheet.
-      collection (str): the collection the units came from.
+      source (SourceBase): the source the units came from. Every column this
+        module cannot compute on its own -- subject, species, tissue, ... --
+        comes from source.samplesheetRow(unit); this function only knows the
+        column set, not how any one source's metadata fills it.
       root (Path): if given, filenames are written relative to it.
       loci (dict): unit_id to the loci observed in its converted output, used to
         derive pcr_target_locus.
@@ -233,7 +218,6 @@ def buildSamplesheet(entries, out, collection, root=None, loci=None):
 
     rows = []
     for unit, path in entries:
-        metadata = unit.metadata or {}
         filename = Path(path)
         if root is not None:
             try:
@@ -244,32 +228,14 @@ def buildSamplesheet(entries, out, collection, root=None, loci=None):
         # sample_id is left for the merge to assign, since it depends on what the
         # samplesheet already contains. The real identifier is preserved in
         # sample_name, which is what the merge keys on.
-        subject = clean(metadata.get('Subject')) or clean(metadata.get('study'))
-
-        rows.append({
+        row = {
             'sample_id': '',
             'filename': str(filename),
-            'subject_id': subject.replace(' ', '_'),
-            'species': clean(metadata.get('Species'), 'human').lower(),
             'pcr_target_locus': targetLocus(loci.get(unit.unit_id, [])),
-            'tissue': clean(metadata.get('BSource'), 'unknown'),
-            # Not derivable from OAS, but airrflow requires the column to be
-            # populated and asks for NA when it is unknown. NA is a placeholder
-            # here too, so a hand-edited value still survives a later merge.
-            'sex': 'NA',
-            'age': clean(metadata.get('Age'), 'NA'),
-            'biomaterial_provider': clean(metadata.get('Author'),
-                                          clean(metadata.get('study'))),
-            # Driven by the collection rather than hardcoded: only paired data is
-            # single cell, and the R implementation assumed TRUE because it only
-            # ever handled paired.
-            'single_cell': 'TRUE' if collection == 'paired' else 'FALSE',
-            'disease_diagnosis': clean(metadata.get('Disease')),
-            'intervention': clean(metadata.get('Vaccine')),
-            'cell_subset': clean(metadata.get('BType')),
-            'study': clean(metadata.get('study')) or unit.study,
             'sample_name': unit.unit_id,
-        })
+        }
+        row.update(source.samplesheetRow(unit))
+        rows.append(row)
 
     existing = loadSamplesheet(out)
     merged = mergeSamplesheet(existing, rows)

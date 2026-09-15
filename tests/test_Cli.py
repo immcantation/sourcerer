@@ -16,11 +16,13 @@ from pathlib import Path
 from unittest import mock
 
 import pandas
+import yaml
 
 # Sourcerer imports
-from sourcerer import Reference
+from sourcerer import Provenance, Reference, Schema
 from sourcerer.Cli import (
     applyPins,
+    formatUnitTable,
     getArgParser,
     handleDownload,
     handleReferenceDiff,
@@ -29,7 +31,7 @@ from sourcerer.Cli import (
     loadMap,
 )
 from sourcerer.Exceptions import SourcererError
-from sourcerer.Sources.Base import DataUnit, DownloadResult, Query, SourceBase
+from sourcerer.Sources.Base import DataUnit, DownloadResult, Query
 from sourcerer.Sources.Imgt import ImgtSource
 from sourcerer.Sources.Oas import OasSource, newReport
 from sourcerer.Sources.Ogrdb import OgrdbSource
@@ -152,24 +154,90 @@ class TestArgParser(unittest.TestCase):
 
         self.assertEqual(doubled, [])
 
+    def test_presence_flags_spell_out_their_tokens(self):
+        """
+        A presence-only flag's usage names the tokens it takes.
 
-class StubSource(SourceBase):
+        `--subject VALUE` said nothing about what VALUE could be; the user only
+        learnt 'defined'/'undefined' from the rejection message.
+        """
+        parser = getArgParser()
+        with mock.patch('sys.stdout', new_callable=io.StringIO) as out:
+            with self.assertRaises(SystemExit):
+                parser.parse_args(['oas', 'search', 'paired', '--help'])
+
+        text = out.getvalue()
+        self.assertIn('--subject {*,defined,undefined}', text)
+        self.assertIn('--species VALUE', text)
+
+
+class TestFormatUnitTable(unittest.TestCase):
+    """
+    Tests for the search/dry-run stdout table
+    """
+
+    def test_shows_metadata_beside_each_hit(self):
+        """
+        The table carries enough metadata to pick units without --out.
+
+        unit_id and a count alone left the user unable to tell one donor's
+        run from another's without first saving a catalog. Which columns to
+        show is the caller's choice (see handleSearch, which passes a
+        source's own search_columns); OAS's are used here as a stand-in.
+        """
+        units = [DataUnit(unit_id='A_2020/csv/a.csv.gz', collection='paired',
+                          url='u', n_sequences=12,
+                          metadata={'Species': 'human', 'Disease': 'None',
+                                    'Subject': 'Donor-1', 'BSource': 'PBMC'}),
+                 DataUnit(unit_id='B_2021/csv/b.csv.gz', collection='paired',
+                          url='u', n_sequences=None, metadata={})]
+
+        lines = formatUnitTable(units, columns=OasSource.search_columns).split('\n')
+
+        self.assertEqual(lines[0].split(),
+                         ['unit_id', 'n_unique_sequences', 'Species', 'Disease',
+                          'Subject', 'BSource'])
+        self.assertEqual(lines[1].split(),
+                         ['A_2020/csv/a.csv.gz', '12', 'human', 'None',
+                          'Donor-1', 'PBMC'])
+        # A unit with no metadata still lines up under the same header.
+        self.assertTrue(lines[2].startswith('B_2021/csv/b.csv.gz'))
+        self.assertEqual(len(lines), 3)
+
+    def test_defaults_to_no_extra_columns(self):
+        """
+        With no columns given, the table carries only identifier and count.
+
+        A generic default here would have to guess at some source's metadata
+        keys; a source with nothing to show should not get blank columns.
+        """
+        units = [DataUnit(unit_id='A_2020/csv/a.csv.gz', collection='human',
+                          url='u', n_sequences=1, metadata={'species': 'human'})]
+
+        lines = formatUnitTable(units).split('\n')
+
+        self.assertEqual(lines[0].split(), ['unit_id', 'n_unique_sequences'])
+
+
+class StubSource(OasSource):
     """
     A source that serves one unit from memory.
 
     Only the seams handleDownload actually touches are real: the network and the
     gzip reader are replaced, so the test exercises the command's bookkeeping
-    rather than OAS parsing, which test_Oas covers.
+    rather than OAS parsing, which test_Oas covers. Subclassing OasSource
+    rather than SourceBase gets samplesheetRow and countUnresolvedSubjects for
+    free, matching the real oas source these stubs stand in for.
     """
 
-    name = 'oas'
     description = 'stub'
     collections = ('paired', 'unpaired')
 
     unit = DataUnit(unit_id='Study_2020/csv_paired/x_1_Paired_All.csv.gz',
                     collection='paired',
                     url='https://example.invalid/x.csv.gz',
-                    metadata={'Species': 'human'}, n_sequences=2)
+                    metadata={'Species': 'human', 'Subject': 'Donor-1'},
+                    n_sequences=2)
 
     def harvestSchema(self):
         raise NotImplementedError
@@ -249,6 +317,49 @@ class TestHandleDownload(unittest.TestCase):
 
         self.assertEqual(list(self.outdir.glob('samplesheet_*')), [])
 
+    def test_no_format_flag_defaults_to_airr_not_raw_alone(self):
+        """
+        Omitting --format writes something airrflow can use immediately.
+
+        The previous default (raw alone) left a user with nothing to run
+        airrflow on until they reran the command with --format; defaulting
+        to airr means the first download already produces a samplesheet.
+        The raw mirror is still written either way, since conversion reads
+        from it.
+        """
+        self.assertEqual(self.runDownload(), 0)
+
+        self.assertTrue((self.outdir / 'samplesheet_airrflow_airr.tsv').exists())
+        self.assertTrue(list(self.outdir.rglob('raw/**/*.csv.gz')))
+        self.assertFalse((self.outdir / 'samplesheet_airrflow_fasta.tsv').exists())
+        self.assertEqual(list(self.outdir.glob('fasta/*.fasta')), [])
+
+    def test_unresolved_subjects_are_warned_about(self):
+        """
+        A batch where OAS recorded no subject at all warns, naming the
+        samplesheet to run `sourcerer oas verify` against.
+
+        This is the most likely silent-wrong-analysis outcome download can
+        produce: every such row gets the same OAS sentinel as subject_id,
+        so airrflow would treat them all as one subject unless the user
+        runs verify first.
+        """
+        unit = DataUnit(unit_id=StubSource.unit.unit_id, collection='paired',
+                        url=StubSource.unit.url,
+                        metadata={'Species': 'human', 'Subject': 'no'},
+                        n_sequences=2)
+        with mock.patch.object(StubSource, 'unit', unit):
+            with self.assertLogs('sourcerer', level='WARNING') as logs:
+                self.assertEqual(self.runDownload(), 0)
+
+        self.assertTrue(any('no subject recorded in OAS' in m for m in logs.output))
+        self.assertTrue(any('oas verify' in m for m in logs.output))
+
+    def test_resolved_subjects_are_not_warned_about(self):
+        """A batch where every unit already has a real subject stays quiet."""
+        with self.assertNoLogs('sourcerer', level='WARNING'):
+            self.assertEqual(self.runDownload(), 0)
+
     def test_both_formats_write_one_samplesheet_each(self):
         """
         Each converted format gets its own samplesheet.
@@ -260,6 +371,141 @@ class TestHandleDownload(unittest.TestCase):
 
         self.assertTrue((self.outdir / 'samplesheet_airrflow_airr.tsv').exists())
         self.assertTrue((self.outdir / 'samplesheet_airrflow_fasta.tsv').exists())
+
+    def test_both_formats_convert_each_unit_once(self):
+        """
+        Requesting two formats reads and normalizes each unit once, not twice.
+
+        Conversion is the expensive step (a multi-GB gzip read plus pandas
+        normalization), and each format used to pull its own pass through it.
+        Both writers are fed from the same chunk stream now, so airr+fasta
+        costs one conversion, and both files still come out complete.
+        """
+        with mock.patch.object(StubSource, 'convertUnit',
+                               autospec=True,
+                               side_effect=StubSource.convertUnit) as convert:
+            self.assertEqual(self.runDownload('airr', 'fasta'), 0)
+
+        self.assertEqual(convert.call_count, 1)
+        airr = next(self.outdir.glob('airr/*.tsv')).read_text().splitlines()
+        fasta = next(self.outdir.glob('fasta/*.fasta')).read_text().splitlines()
+        self.assertEqual(len(airr), 3)
+        self.assertEqual(len(fasta), 4)
+
+
+class TwoUnitStubSource(OasSource):
+    """
+    A source serving two units with distinct conversion reports.
+
+    StubSource above always serves exactly one unit with a fixed report, which
+    cannot tell "recorded once" from "summed across the whole run" apart. This
+    exercises that: each unit's convertUnit returns different counters, so a
+    correct run total has to actually add them rather than just reflect
+    whichever unit happened to run last.
+    """
+
+    description = 'stub'
+    collections = ('paired',)
+
+    units = (
+        DataUnit(unit_id='Study_2020/csv/one.csv.gz', collection='paired',
+                url='https://example.invalid/one.csv.gz',
+                metadata={'Species': 'human', 'Subject': 'Donor-1'},
+                n_sequences=2),
+        DataUnit(unit_id='Study_2020/csv/two.csv.gz', collection='paired',
+                url='https://example.invalid/two.csv.gz',
+                metadata={'Species': 'human', 'Subject': 'Donor-2'},
+                n_sequences=3),
+    )
+
+    def harvestSchema(self):
+        raise NotImplementedError
+
+    def searchUnits(self, query):
+        return list(self.units)
+
+    def readUnit(self, path, unit):
+        raise NotImplementedError
+
+    def normalizeChunk(self, metadata, chunk, unit, offset, report):
+        raise NotImplementedError
+
+    def validateQuery(self, collection, filters):
+        return Query(collection=collection, filters=filters)
+
+    def fetchUnit(self, unit, outdir, resume=True):
+        path = Path(outdir) / unit.unit_id
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'raw')
+
+        return DownloadResult(unit=unit, path=path, sha256='0' * 64, size_bytes=3)
+
+    def convertUnit(self, path, unit, chunksize=50000):
+        frame = pandas.DataFrame(
+            {'sequence_id': ['a'], 'cell_id': ['c1'], 'sequence': ['ACGT'],
+             'locus': ['IGH'], 'c_call': ['IGHM']})
+        report = newReport()
+        if unit.unit_id.endswith('one.csv.gz'):
+            report.update(rows_in=2, rows_out=2, missing_c_call=1, loci={'IGH'})
+        else:
+            report.update(rows_in=3, rows_out=3, missing_c_call=2, loci={'IGK'})
+
+        return {'Species': 'human'}, iter([frame]), report
+
+
+class TestConversionReportProvenance(unittest.TestCase):
+    """
+    Tests for the run level conversion_report and schema_fingerprint that
+    handleDownload writes into download_metadata.yml
+    """
+
+    def setUp(self):
+        self.outdir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.outdir, ignore_errors=True)
+
+    def runDownload(self, *formats):
+        argv = ['oas', 'download', 'paired', '--outdir', str(self.outdir)]
+        for value in formats:
+            argv += ['--format', value]
+
+        args = getArgParser().parse_args(argv)
+        args.source = 'oas'
+
+        with mock.patch('sourcerer.Cli.getSource', return_value=TwoUnitStubSource(None)):
+            return handleDownload(args)
+
+    def lastRun(self):
+        text = (self.outdir / Provenance.DOWNLOAD_METADATA).read_text()
+        return yaml.safe_load(text)['runs'][-1]
+
+    def test_conversion_counters_sum_across_every_unit_in_the_run(self):
+        """
+        A run converting two units must report the run as a whole, not
+        whichever unit's counters happened to be computed last.
+        """
+        self.assertEqual(self.runDownload('airr'), 0)
+
+        report = self.lastRun()['conversion_report']
+        self.assertEqual(report['rows_in'], 5)
+        self.assertEqual(report['rows_out'], 5)
+        self.assertEqual(report['missing_c_call'], 3)
+        self.assertEqual(sorted(report['loci']), ['IGH', 'IGK'])
+
+    def test_a_raw_only_run_records_no_conversion_report(self):
+        """Nothing was converted, so there is nothing to report."""
+        self.assertEqual(self.runDownload('raw'), 0)
+
+        self.assertNotIn('conversion_report', self.lastRun())
+
+    def test_the_run_records_a_schema_fingerprint(self):
+        """
+        Ties the download to the exact snapshot content it was resolved
+        against, not only a harvest date and tool version.
+        """
+        self.assertEqual(self.runDownload('airr'), 0)
+
+        self.assertEqual(self.lastRun()['schema_fingerprint'],
+                         Schema.fingerprint('oas'))
 
 
 def makeReference(root, chain='IGHV', records=(('IGHV1-2*02', 'ACGT'),)):

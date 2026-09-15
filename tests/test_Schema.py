@@ -17,6 +17,7 @@ from sourcerer.Schema import (
     Collection,
     Field,
     SourceSchema,
+    fingerprint,
     fromDict,
     loadSchema,
     saveSchema,
@@ -65,6 +66,37 @@ class TestValidation(unittest.TestCase):
             self.schema.validateFilters('paired', {'Species': 'humn'})
 
         self.assertIn('human', str(raised.exception))
+
+    def test_accepts_a_unique_case_insensitive_match(self):
+        """
+        'Human' resolves to 'human' rather than erroring with a hint.
+
+        The value sent upstream is the source's own spelling, since the remote
+        form is case sensitive, so what the user typed is normalized rather
+        than passed through.
+        """
+        resolved = self.schema.validateFilters('paired', {'Species': 'Human'})
+        self.assertEqual(resolved['Species'], 'human')
+
+        resolved = self.schema.validateFilters('paired', {'Species': 'RAT_sd'})
+        self.assertEqual(resolved['Species'], 'rat_SD')
+
+    def test_case_insensitive_match_must_be_unique(self):
+        """Two values differing only in case leave the folded form ambiguous."""
+        schema = SourceSchema(
+            source='demo', harvested='2026-08-04T00:00:00Z', harvested_by='test',
+            collections={'c': Collection(name='c', fields=(
+                Field(name='Isotype', values=('IgG', 'IGG')),))})
+
+        self.assertEqual(schema.validateFilters('c', {'Isotype': 'IgG'})['Isotype'],
+                         'IgG')
+        with self.assertRaises(SchemaError):
+            schema.validateFilters('c', {'Isotype': 'igg'})
+
+    def test_presence_tokens_are_not_case_folded(self):
+        """Presence-only fields take exactly their tokens; 'Defined' is rejected."""
+        with self.assertRaises(SchemaError):
+            self.schema.validateFilters('paired', {'Age': 'Defined'})
 
     def test_rejects_an_unknown_field(self):
         with self.assertRaises(SchemaError):
@@ -170,6 +202,77 @@ class TestQuietWrite(unittest.TestCase):
             _, changed = saveSchema(changed_schema, path)
 
             self.assertTrue(changed)
+
+
+class TestFingerprint(unittest.TestCase):
+    """
+    Tests for hashing a snapshot into one string identifying its content
+
+    This is what a download's provenance record uses to tie itself to the
+    exact snapshot it was resolved against, since harvested/harvested_by
+    (a date and a tool version) only narrow that down.
+    """
+
+    def test_the_same_snapshot_hashes_the_same_way_twice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            saveSchema(makeSchema(), path)
+
+            self.assertEqual(fingerprint('demo', path=path),
+                             fingerprint('demo', path=path))
+
+    def test_a_content_change_changes_the_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            saveSchema(makeSchema(), path)
+            before = fingerprint('demo', path=path)
+
+            changed_schema = makeSchema()
+            changed_schema.collections['paired'] = Collection(
+                name='paired', fields=(Field(name='Species',
+                                             values=('human', 'newt')),))
+            saveSchema(changed_schema, path)
+
+            self.assertNotEqual(fingerprint('demo', path=path), before)
+
+    def test_a_quiet_refresh_leaves_the_fingerprint_unchanged(self):
+        """
+        saveSchema leaves schema.yaml untouched, timestamp included, when a
+        fresh harvest's content is otherwise identical (see TestQuietWrite);
+        the fingerprint, hashing whatever bytes are actually on disk, is
+        therefore unchanged too. If that ever stopped being true, a download
+        made on a quiet month would record a schema_fingerprint that looked
+        like drift when none occurred.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            saveSchema(makeSchema(), path)
+            before = fingerprint('demo', path=path)
+
+            saveSchema(makeSchema(harvested='2026-09-01T00:00:00Z'), path)
+
+            self.assertEqual(fingerprint('demo', path=path), before)
+
+    def test_no_schema_yaml_is_none_not_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(fingerprint('demo', path=Path(tmp)))
+
+    def test_the_packaged_oas_snapshot_hashes_and_is_stable(self):
+        """
+        OAS is the one source with a catalog fingerprint file, so this also
+        covers the fold-in-the-catalog-sha256 path against real data.
+        """
+        digest = fingerprint('oas')
+
+        self.assertIsNotNone(digest)
+        self.assertEqual(fingerprint('oas'), digest)
+
+    def test_a_source_with_no_catalog_fingerprint_still_hashes(self):
+        """IMGT has a schema.yaml but no catalog_fingerprint.json."""
+        self.assertIsNotNone(fingerprint('imgt'))
+
+    def test_an_unknown_source_is_none_not_an_error(self):
+        self.assertIsNone(fingerprint('does-not-exist'))
 
 
 class TestPackagedSnapshot(unittest.TestCase):
